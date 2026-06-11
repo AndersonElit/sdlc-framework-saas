@@ -10,13 +10,21 @@ Framework de automatización de las etapas del ciclo de vida del desarrollo de s
 Requerimiento del cliente
         │
         ▼
-[Paso 1] Diligenciar input-template.md  →  requerimiento/<archivo>.md
+[Paso 1] Diligenciar input-template.md      →  requerimiento/<archivo>.md
         │
         ▼
-[Paso 2] /plan-pid                       →  docs/planning/PID-<proyecto>.md
+[Paso 2] /plan-pid                           →  docs/planning/PID-<proyecto>.md
         │
         ▼
-[Paso 3] /requirements-srs              →  docs/requirements/SRS-<proyecto>.md
+[Paso 3] /requirements-srs                  →  docs/requirements/SRS-<proyecto>.md
+        │
+        ▼
+[Paso 4] Diligenciar input-adc-template.md  →  docs/planning/ADC-<proyecto>.md
+        │
+        ▼
+[Paso 5] /strategic-design-sdd              →  docs/strategic-design/SDD-<proyecto>-domain.md
+                                                docs/strategic-design/SDD-<proyecto>-security.md
+                                                docs/strategic-design/SDD-<proyecto>-architecture.md
 ```
 
 ---
@@ -137,7 +145,114 @@ Un **Software Requirements Specification (SRS)** profesional con las siguientes 
 
 - El SRS se construye a partir del PID; no es necesario reprocesar el requerimiento original.
 - Cada requerimiento funcional tiene ID único y criterios de aceptación verificables.
-- El documento queda listo para pasar a la etapa de Diseño del Sistema y Arquitectura.
+- El documento queda listo para pasar a la etapa de Diseño Estratégico.
+
+---
+
+## Paso 4 — Contexto Arquitectónico (ADC)
+
+**Objetivo:** capturar decisiones tecnológicas, restricciones y drivers de arquitectura antes de ejecutar el diseño estratégico. El ADC enriquece el SDD con información que no proviene del análisis funcional.
+
+### Instrucciones
+
+1. Abre la plantilla ADC:
+
+   ```
+   .claude/formatos/input-adc-template.md
+   ```
+
+2. Completa los campos marcados con `*` (obligatorios). Los opcionales permiten mayor precisión en el SDD; si se omiten, la skill infiere valores desde el SRS.
+
+3. Guarda el archivo completado en `docs/planning/`:
+
+   ```
+   docs/planning/ADC-<nombre-proyecto>.md
+   ```
+
+### Campos principales del ADC
+
+| Sección | Descripción |
+|---------|-------------|
+| Contexto Tecnológico | Stack mandatorio/permitido/excluido por capa |
+| Infraestructura y Despliegue | Cloud provider, modelo de servicio, contenedores |
+| Estilo Arquitectónico | Monolito / microservicios / serverless / event-driven |
+| Atributos de Calidad y SLAs | Disponibilidad, latencia, throughput, RTO/RPO |
+| Escala y Crecimiento | Usuarios esperados y volumen de datos por año |
+| Compliance y Regulaciones | GDPR, HIPAA, PCI-DSS, normativas locales |
+| Integraciones | Sistemas legados, APIs de terceros, estrategia Saga |
+| Equipo y Capacidad | Tamaño, perfil, experiencia con el estilo elegido |
+| Presupuesto de Infraestructura | Costo mensual y restricciones de licencias |
+| Reportería | Solo si el sistema genera reportes PDF/XLS/CSV |
+
+### Notas
+
+- El ADC es **opcional** para `/strategic-design-sdd`; sin él, el SDD se basa únicamente en el SRS.
+- Cuando se provee, el ADC tiene **precedencia** sobre lo inferido del SRS: sus decisiones son restricciones del proyecto, no sugerencias.
+
+---
+
+## Paso 5 — Etapa SDLC: Diseño Estratégico
+
+**Skill:** `/strategic-design-sdd`  
+**Entrada:** SRS generado en el Paso 3 + ADC generado en el Paso 4 (opcional)  
+**Salida:** tres documentos en `docs/strategic-design/`
+
+### Instrucciones
+
+Sin argumentos (usa automáticamente el SRS de `docs/requirements/` sin ADC):
+
+```
+/strategic-design-sdd
+```
+
+Con SRS explícito:
+
+```
+/strategic-design-sdd docs/requirements/SRS-<nombre-proyecto>.md
+```
+
+Con SRS y ADC:
+
+```
+/strategic-design-sdd docs/requirements/SRS-<nombre-proyecto>.md docs/planning/ADC-<nombre-proyecto>.md
+```
+
+### Qué genera
+
+Tres documentos complementarios que conforman el **Strategic Design Document (SDD)**:
+
+#### `SDD-<proyecto>-domain.md` — Dominio y Comportamiento
+
+1. Introducción
+2. Visión del Dominio
+3. Ubiquitous Language
+4. Bounded Contexts
+5. Context Map
+6. Modelos de Dominio
+7. Eventos de Dominio (`DE-001`, `DE-002`…)
+8. Workflows de Negocio
+9. Criterios de Aceptación — ATDD (`AC-001`…)
+10. Escenarios BDD (formato Gherkin)
+
+#### `SDD-<proyecto>-security.md` — Seguridad
+
+1. Modelo de Seguridad (principios, identidad, autorización, datos sensibles)
+2. Threat Modeling (tabla STRIDE: `TH-001`…)
+3. Trust Boundaries (zonas de confianza y flujos que las cruzan)
+
+#### `SDD-<proyecto>-architecture.md` — Estrategia Arquitectónica
+
+1. Drivers Arquitectónicos (atributos de calidad, restricciones, cross-cutting concerns)
+2. Decisiones Estratégicas (`DS-001`, `DS-002`…)
+3. Riesgos y Tradeoffs
+4. Recomendación y Próximos Pasos
+
+### Notas
+
+- Los escenarios BDD incluyen obligatoriamente camino feliz **y** escenarios de error.
+- Si el ADC declara CQRS, el SDD incorpora las decisiones encadenadas de segregación write/read, Projection Service y read model relacional.
+- Si el ADC declara reportería, el SDD materializa el subsistema ETL Spark + capa serverless de formatos.
+- El SDD queda listo para iniciar la etapa de Diseño Técnico del Sistema.
 
 ---
 
@@ -145,17 +260,22 @@ Un **Software Requirements Specification (SRS)** profesional con las siguientes 
 
 ```
 sdlc-framework-saas/
-├── requerimiento/              # Paso 1: requerimientos diligenciados por el cliente
+├── requerimiento/                  # Paso 1: requerimientos diligenciados por el cliente
 ├── docs/
-│   ├── planning/               # Paso 2: PIDs generados por /plan-pid
-│   └── requirements/           # Paso 3: SRS generados por /requirements-srs
+│   ├── planning/                   # Paso 2 y 4: PIDs y ADCs del proyecto
+│   ├── requirements/               # Paso 3: SRS generados por /requirements-srs
+│   └── strategic-design/           # Paso 5: SDD generados por /strategic-design-sdd
+│       ├── SDD-<proyecto>-domain.md
+│       ├── SDD-<proyecto>-security.md
+│       └── SDD-<proyecto>-architecture.md
 └── .claude/
     ├── formatos/
-    │   ├── input-template.md       # Plantilla de captura del requerimiento
-    │   └── input-adc-template.md   # Plantilla de contexto arquitectónico (ADC)
+    │   ├── input-template.md           # Plantilla de captura del requerimiento (Paso 1)
+    │   └── input-adc-template.md       # Plantilla de contexto arquitectónico (Paso 4)
     └── skills/
-        ├── plan-pid/               # Skill de planeación
-        └── requirements-srs/       # Skill de análisis de requerimientos
+        ├── plan-pid/                   # Skill de planeación
+        ├── requirements-srs/           # Skill de análisis de requerimientos
+        └── strategic-design-sdd/       # Skill de diseño estratégico
 ```
 
 ---
@@ -167,8 +287,10 @@ sdlc-framework-saas/
 | 1 | Captura de requerimiento | — (template manual) | Disponible |
 | 2 | Planeación | `/plan-pid` | Disponible |
 | 3 | Análisis de Requerimientos | `/requirements-srs` | Disponible |
-| 4 | Diseño del Sistema y Arquitectura | `/strategic-design-sdd` | Próximamente |
-| 5 | Desarrollo | — | Próximamente |
-| 6 | Pruebas | — | Próximamente |
-| 7 | Despliegue | — | Próximamente |
-| 8 | Mantenimiento | — | Próximamente |
+| 4 | Contexto Arquitectónico | — (template manual ADC) | Disponible |
+| 5 | Diseño Estratégico | `/strategic-design-sdd` | Disponible |
+| 6 | Diseño Técnico del Sistema | — | Próximamente |
+| 7 | Desarrollo | — | Próximamente |
+| 8 | Pruebas | — | Próximamente |
+| 9 | Despliegue | — | Próximamente |
+| 10 | Mantenimiento | — | Próximamente |
