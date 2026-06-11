@@ -51,12 +51,23 @@ Tecnologías que NO deben usarse y por qué:
 
 ## 3. Infraestructura y Despliegue *
 
-- **Modelo de despliegue:** (cloud / on-premise / híbrido)
-- **Cloud provider:** (AWS / Azure / GCP / ninguno / por definir)
-- **Región / residencia de datos:** 
+> **Decisión de infraestructura por defecto (framework SDLC):**
+> - **Entorno local / dev:** VPS local = VM QEMU/KVM creada con `.claude/scripts/qemu-vps.sh`, configurada compatible con OCI (Ubuntu, SSH key-only, sudo NOPASSWD, UFW, UTC, NTP, cloud-init NoCloud). K3s, PostgreSQL 16, MongoDB 7 y Gitea corren como servicios systemd nativos en la VM.
+> - **Producción:** VPS en Oracle Cloud Infrastructure (OCI) — misma imagen Ubuntu, misma configuración base que el entorno local. K3s, PostgreSQL 16 y MongoDB 7 como servicios systemd nativos en el VPS OCI; OCIR (Oracle Container Registry) como registry de imágenes.
+>
+> Los campos marcados con `[por defecto]` ya están definidos por el framework. Confirmar o sobreescribir según el proyecto.
+
+- **Modelo de despliegue:** VPS-nativo (local + cloud) / on-premise / híbrido `[por defecto: VPS-nativo]`
+- **Cloud provider:** Oracle Cloud Infrastructure (OCI) / AWS / Azure / GCP / ninguno / por definir `[por defecto: OCI]`
+- **Región OCI / residencia de datos:** (ej. sa-saopaulo-1 / us-ashburn-1 / por definir)
+- **Shape OCI producción:** (ej. VM.Standard.A1.Flex 4 OCPU 24 GB / VM.Standard.E4.Flex / por definir)
 - **Modelo de servicio:** (SaaS / on-premise instalable / white-label / embebido)
-- **Entornos requeridos:** (desarrollo / staging / producción / DR)
-- **Estrategia de contenedores:** (Docker / Kubernetes / serverless / ninguna / por definir)
+- **Entornos requeridos:** `[por defecto: dev=VM QEMU/KVM local, prod=VPS Oracle Cloud OCI]` / agregar staging si aplica
+- **Estrategia de contenedores:** K3s nativo en VPS / Docker Compose / Kubernetes managed / por definir `[por defecto: K3s nativo en VPS en ambos entornos]`
+- **Registry de imágenes:** `[por defecto: Gitea Package Registry en VPS local (dev) / OCIR en Oracle Cloud (prod)]`
+- **Base de datos:** `[por defecto: PostgreSQL 16 y MongoDB 7 como servicios systemd nativos en VPS en ambos entornos]`
+- **Identidad / autenticación:** OCI IAM / Keycloak en VPS / por definir
+- **Secretos:** OCI Vault / variables de entorno cifradas en VPS / por definir
 
 ---
 

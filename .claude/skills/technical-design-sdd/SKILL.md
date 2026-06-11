@@ -559,14 +559,14 @@ Esta sección debe indicar que la infraestructura base del proyecto se aprovisio
 
 Este script genera el árbol Terraform multi-ambiente (`dev`/`staging`/`prod`) para:
 
-- **Frontend**: pod Kubernetes (Deployment + Service + Ingress Traefik) en K3s — imagen construida por Jenkins, publicada en **Gitea Package Registry** (OCI nativo), desplegada por ArgoCD. En staging/prod puede usarse EKS + ALB.
-- **Backend (AWS)**: EKS, IAM, Cognito, API Gateway, Secrets Manager. **Nota sobre dev**: en el ambiente `dev` el cluster Kubernetes es **K3s nativo en VPS Ubuntu 26.04 LTS** (sin Docker wrapper); el registry de imágenes es el **Gitea Package Registry** (`VPS_IP:3000/<org>`); **PostgreSQL 16 y MongoDB 7 corren como servicios systemd nativos** en el VPS (sin RDS/ECR de floci en dev); EKS y RDS aplican solo a `staging`/`prod`.
+- **Frontend**: pod Kubernetes (Deployment + Service + Ingress Traefik) en K3s — imagen construida por Jenkins, publicada en **Gitea Package Registry** (`VPS_IP:3000/<org>`) en dev o **OCIR (Oracle Container Registry)** en prod, desplegada por ArgoCD.
+- **Infraestructura VPS (ambos entornos)**: K3s nativo en VPS Ubuntu. **Entorno dev**: VM QEMU/KVM local creada con `.claude/scripts/qemu-vps.sh` (configuración compatible OCI: SSH key-only, sudo NOPASSWD, UFW, UTC, NTP, cloud-init NoCloud); registry en **Gitea Package Registry**; **PostgreSQL 16 y MongoDB 7 corren como servicios systemd nativos** en la VM. **Entorno producción**: VPS en **Oracle Cloud Infrastructure (OCI)**; registry en **OCIR**; PostgreSQL 16 y MongoDB 7 como servicios systemd nativos en el VPS OCI; identidad vía **OCI IAM** o Keycloak en VPS; secretos vía **OCI Vault** o variables de entorno cifradas.
 
 # REGLAS PARA LA REFERENCIA AL SCRIPT
 
 - Referenciar el script por su ruta relativa: `.claude/scripts/base-infrastructure-builder.sh`.
 - Indicar que se ejecuta tras completar la etapa de Diseño Técnico, usando las decisiones de este documento (`infrastructure.md`) como insumos.
-- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera/verifica el script (K3s nativo en VPS en dev / EKS en staging/prod, PostgreSQL nativo en VPS / RDS en staging/prod, Gitea Package Registry / ECR en staging/prod, Cognito, API Gateway, Secrets Manager). **No mencionar ECR ni RDS como recursos de dev** — son exclusivos de staging/prod.
+- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera/verifica el script: K3s nativo en VPS (dev=VM QEMU/KVM local, prod=VPS Oracle Cloud OCI); PostgreSQL 16 y MongoDB 7 nativos en VPS en ambos entornos; Gitea Package Registry en dev / OCIR en prod; OCI IAM o Keycloak para identidad en prod; OCI Vault para secretos en prod. **No mencionar EKS, RDS ni ECR** — el modelo es VPS-nativo tanto en entorno local como en Oracle Cloud.
 - Si una decisión técnica del diseño difiere de lo que provisiona el script por defecto, indicarlo explícitamente como ajuste requerido.
 - Si el diseño incluye orquestación de saga con coordinador LRA, la tabla de componentes debe incluir el **coordinador Narayana LRA** (servicio systemd `lra-coordinator` en el VPS, puerto 50000) y, para las pruebas de integración de las rutas Camel, **WireMock** (servicio systemd `wiremock` en el VPS, puerto 9999). Ambos los aprovisiona `vps-setup.sh services`.
 
@@ -804,32 +804,32 @@ Si el ADC declara reportería, materialízala técnicamente en los tres document
 
 **En SDD-system.md (Arquitectura del Sistema / C4):**
 - Añade los siguientes contenedores al C4 nivel 2:
-  - `report-etl-service` (Spark batch Scala — **CronJob K8s**): único job Spark que realiza extracción, validación de esquema y transformación por tipo de reporte (patrón Factory). Genera un `.parquet` en S3 y publica el evento Kafka `ReportParquetGenerated` (URL del `.parquet` + formato destino csv/xls). **No expone endpoints HTTP; es un job batch ejecutado por schedule.**
-  - Lambda Kafka Consumer: única Lambda (Python 3.12) que consume `ReportParquetGenerated`, genera el archivo en el formato pedido (csv/xls) a partir del `.parquet` en S3 y almacena el reporte final en S3. **Sin EventBridge intermedio.**
+  - `report-etl-service` (Spark batch Scala — **CronJob K8s**): único job Spark que realiza extracción, validación de esquema y transformación por tipo de reporte (patrón Factory). Genera un `.parquet` en almacenamiento de objetos (OCI Object Storage en prod / MinIO en VPS local o directorio en dev) y publica el evento Kafka `ReportParquetGenerated` (URL del `.parquet` + formato destino csv/xls). **No expone endpoints HTTP; es un job batch ejecutado por schedule.**
+  - Servicio de formatos Kafka Consumer: servicio (OCI Functions en prod / servicio en VPS en dev) que consume `ReportParquetGenerated`, genera el archivo en el formato pedido (csv/xls) a partir del `.parquet` y almacena el reporte final en almacenamiento de objetos. **Sin EventBridge intermedio.**
   - Si el ADC declara CQRS: añade `projection-service` (Spring Boot reactivo, Kafka consumer + R2DBC PostgreSQL): consume eventos de dominio de todos los microservicios y escribe tablas desnormalizadas en `<prefix>_readmodel`. **Es el único escritor del read model.** El `report-etl-service` lee `<prefix>_readmodel` vía JDBC.
-- En el **Stack Tecnológico**: Apache Spark 3.5.1 / Scala 2.13 (fat JAR sbt-assembly), S3 (floci en dev), Kafka, AWS Lambda Python 3.12, Kubernetes CronJob (despliegue de `report-etl-service`). Si el ADC declara CQRS: añadir **Spark JDBC** (lectura del read model PostgreSQL); el read model es **PostgreSQL relacional** — eliminar `mongo-spark-connector` como opción.
+- En el **Stack Tecnológico**: Apache Spark 3.5.1 / Scala 2.13 (fat JAR sbt-assembly), almacenamiento de objetos (OCI Object Storage en prod / MinIO o directorio local en dev), Kafka, servicio de formatos (OCI Functions en prod / servicio en VPS en dev), Kubernetes CronJob (despliegue de `report-etl-service`). Si el ADC declara CQRS: añadir **Spark JDBC** (lectura del read model PostgreSQL); el read model es **PostgreSQL relacional** — eliminar `mongo-spark-connector` como opción.
 - Representa `report-etl-service` en el C4 como contenedor batch con su expresión cron (no como servicio REST).
 - Si el ADC declara CQRS: describe el `projection-service` en **Componentes del Sistema** con su rol: proyector de eventos CQRS, único escritor del read model; usa R2DBC reactivo para escribir tablas desnormalizadas (ej. `report_sales`, `report_customers`).
 
 **En SDD-design.md (Diseño Técnico):**
 - **Flujo ETL** en *Flujos Técnicos Principales*:
-  1. `report-etl-service` (Spark, CronJob K8s): extrae fuente de datos → valida esquema (`report_schema_catalog`) → transforma por tipo (Factory) → genera `.parquet` en S3 → publica `ReportParquetGenerated` (URL parquet + formato destino).
-  2. Lambda Kafka Consumer consume `ReportParquetGenerated` → genera csv/xls desde `.parquet` → almacena reporte final en S3.
+  1. `report-etl-service` (Spark, CronJob K8s): extrae fuente de datos → valida esquema (`report_schema_catalog`) → transforma por tipo (Factory) → genera `.parquet` en almacenamiento de objetos → publica `ReportParquetGenerated` (URL parquet + formato destino).
+  2. Servicio de formatos Kafka Consumer consume `ReportParquetGenerated` → genera csv/xls desde `.parquet` → almacena reporte final en almacenamiento de objetos.
 - Si el ADC declara CQRS: añade los pasos previos al paso 1 del **Flujo ETL con CQRS**:
   1. Domain MSes publican eventos a Kafka (`CustomerCreated`, `OrderCreated`, `PaymentCompleted`, etc.)
   2. `projection-service` consume todos los eventos y proyecta tablas desnormalizadas en `<prefix>_readmodel` (PostgreSQL).
   3. `report-etl-service` (Spark, `--source jdbc`) lee `<prefix>_readmodel` vía `SparkJdbcSourceAdapter` → valida esquema → transforma por tipo (Factory) → genera `.parquet` → publica `ReportParquetGenerated`.
-  4. Lambda Kafka Consumer consume `ReportParquetGenerated` → genera csv/xls → almacena reporte final en S3.
+  4. Servicio de formatos Kafka Consumer consume `ReportParquetGenerated` → genera csv/xls → almacena reporte final en almacenamiento de objetos.
 - En **Diseño de Persistencia**:
-  - Layout S3: `.parquet` generado por `report-etl-service` y archivos de salida (`output/{csv,xls}/`) generados por la Lambda.
+  - Layout almacenamiento de objetos (OCI Object Storage / MinIO local): `.parquet` generado por `report-etl-service` y archivos de salida (`output/{csv,xls}/`) generados por el servicio de formatos.
   - **`<prefijo>_reporting`** (PostgreSQL): tabla `report_schema_catalog` (`report_type` PK, `schema_version`, `columns` jsonb, `integrity_rules` jsonb, `updated_at`); su schema se aplica vía Liquibase (repo `<proyecto>-migrations` en Gitea), no con SQL inline; `report-etl-service` la consulta para validar el DataFrame extraído.
   - Si el ADC declara CQRS: **`<prefijo>_readmodel`** (PostgreSQL, Database-per-Service del Projection Service): tablas desnormalizadas optimizadas para extracción; ej. `report_sales (customer_id, customer_name, order_id, order_total, payment_amount, payment_date)`. `report-etl-service` la lee con `SELECT * FROM report_sales` vía JDBC — sin JOINs entre BDs operacionales. Incluir en la tabla de BDs la columna "BD propietaria" indicando que `<prefix>_readmodel` es propiedad del `projection-service` y que es **read-only para el resto**.
 - Documenta el evento `ReportParquetGenerated` (contrato JSON: URL del `.parquet` en S3 + formato destino) y el evento de fallo `ReportETLFailed`.
 
 **En SDD-infrastructure.md (ADR):**
 - `ADR-xxx` — **ETL Spark unificado** (`report-etl-service`) desplegado como **Kubernetes CronJob** (no Deployment); schedule configurable por ambiente vía `--schedule "<cron>"`; ArgoCD sincroniza el CronJob; Jenkins termina en `bumpImageTag` (sin smoke tests HTTP). Tradeoff: simplicidad operacional al eliminar el contrato inter-MS vs. latencia introducida por el schedule.
-- `ADR-xxx` — ETL Spark unificado; patrón Factory de transformadores (Abierto/Cerrado); `.parquet` como formato de transferencia entre el ETL y la Lambda.
-- `ADR-xxx` — Capa serverless: única Lambda Kafka Consumer (sin EventBridge) sobre floci en dev y AWS real en prod.
+- `ADR-xxx` — ETL Spark unificado; patrón Factory de transformadores (Abierto/Cerrado); `.parquet` como formato de transferencia entre el ETL y el servicio de formatos.
+- `ADR-xxx` — Servicio de formatos Kafka Consumer (OCI Functions en prod / servicio en VPS en dev) sin EventBridge intermedio; almacenamiento en OCI Object Storage (prod) o MinIO/directorio local (dev).
 - Si el ADC declara CQRS:
   - `ADR-xxx` — **CQRS con read model PostgreSQL relacional**: el `projection-service` proyecta eventos de dominio (Kafka) sobre tablas SQL desnormalizadas en `<prefix>_readmodel`; `report-etl-service` lee con JDBC (`SparkJdbcSourceAdapter`). Tradeoff: consistencia eventual + queries SQL expresivos sin JOINs entre BDs operacionales.
 
