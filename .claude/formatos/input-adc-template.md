@@ -66,8 +66,8 @@ Tecnologías que NO deben usarse y por qué:
 - **Estrategia de contenedores:** K3s nativo en VPS / Docker Compose / Kubernetes managed / por definir `[por defecto: K3s nativo en VPS en ambos entornos]`
 - **Registry de imágenes:** `[por defecto: Gitea Package Registry en VPS local (dev) / OCIR en Oracle Cloud (prod)]`
 - **Base de datos:** `[por defecto: PostgreSQL 16 y MongoDB 7 como servicios systemd nativos en VPS en ambos entornos]`
-- **Identidad / autenticación:** OCI IAM / Keycloak en VPS / por definir
-- **Secretos:** OCI Vault / variables de entorno cifradas en VPS / por definir
+- **Identidad / autenticación:** `[por defecto: Keycloak en VPS (ambos entornos)]` / OCI IAM / por definir
+- **Secretos:** `[por defecto: HashiCorp Vault en VPS (ambos entornos)]` / variables de entorno cifradas / por definir
 
 ---
 
