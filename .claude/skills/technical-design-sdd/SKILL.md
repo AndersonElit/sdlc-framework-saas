@@ -346,7 +346,7 @@ Definir:
 Todo diseño de microservicios **debe** declarar explícitamente el patrón **Database-per-Service**:
 
 - Cada microservicio posee y gestiona su propia base de datos; ningún otro servicio accede directamente a ella (ni para lectura ni para escritura).
-- Las bases de datos se provisionan automáticamente por `init-databases.sh` usando la convención: `<prefijo>_<servicio_slug>` (ej. `mydb_clientes_service`). El prefijo se define en `scaffold-all-services.sh` con `-p <prefijo-pg>` / `-m <prefijo-mongo>`.
+- Las bases de datos se provisionan automáticamente por `init-databases.sh` usando la convención: `<prefijo>_<servicio_slug>` (ej. `mydb_clientes_service`). Los prefijos se pasan con `--pg-prefix` / `--mongo-prefix`.
 - El esquema inicial de cada servicio lo aplica **Liquibase standalone** (`run-liquibase-migrations.sh --gitea-clone`) como paso previo al despliegue; los changelogs residen en el repo Git dedicado **`<proyecto>-migrations`** en Gitea del VPS (`http://VPS_IP:3000/<proyecto>/<proyecto>-migrations`), **no** en el mismo repo de la aplicación ni embebidos en el JAR (Flyway requiere JDBC bloqueante — incompatible con los servicios R2DBC del framework).
 - La comunicación entre servicios que necesita datos de otra BD se resuelve mediante **eventos de dominio** (Kafka) o **llamadas REST** al servicio propietario — nunca acceso directo a la BD ajena.
 - En la tabla resumen de entidades, incluir una columna **"BD propietaria"** que indique la base de datos que le corresponde a cada servicio según la convención de nombres.
@@ -398,11 +398,11 @@ Si el diseño usa más de un motor (por ejemplo PostgreSQL para un contexto y Mo
 - Reflejar las relaciones y trust boundaries del dominio (referencias, foreign keys, embedding).
 - Elegir el formato (`.sql`, `.js` o ambos) según el tipo de base de datos decidido en el Stack Tecnológico de `system.md`.
 - Mantener nivel de diseño: esquema y estructura, sin datos de prueba ni lógica de aplicación.
-- **Separación por BD (Database-per-Service):** los comentarios `-- BC-XX:` en el `schema.sql` delimitan los bloques de tablas de cada microservicio. Cada bloque `-- BC-XX:` se extrae por `scaffold-all-services.sh` al changelog Liquibase `00001_initial_schema.yaml` del servicio correspondiente, se publica en el repo **`<proyecto>-migrations`** en Gitea del VPS y se aplica sobre su BD propia (`<prefijo>_<svc_slug>`) mediante `run-liquibase-migrations.sh --gitea-clone`. **No existe un schema global compartido en producción**; el `schema.sql` es únicamente el artefacto de diseño de referencia.
+- **Separación por BD (Database-per-Service):** los comentarios `-- BC-XX:` en el `schema.sql` delimitan los bloques de tablas de cada microservicio. Cada bloque `-- BC-XX:` corresponde al changelog Liquibase `00001_initial_schema.yaml` del servicio, que se publica en el repo **`<proyecto>-migrations`** en Gitea (`http://VPS_IP:3000/<proyecto>/<proyecto>-migrations`) y se aplica sobre su BD propia (`<prefijo>_<svc_slug>`) mediante `run-liquibase-migrations.sh --gitea-clone`. **No existe un schema global compartido en producción**; el `schema.sql` es únicamente el artefacto de diseño de referencia.
 - **Tablas de soporte para Saga y Outbox (si aplica):** si el diseño incluye sagas, añade al `schema.sql` (bajo un comentario de bounded context propio) las tablas de soporte, agrupadas por su servicio propietario:
   - En el **servicio orquestador** (`integration-service`): `saga_instance` (`saga_id` PK, `saga_type`, `state`, `current_step`, `payload jsonb`, timestamps) y `saga_step_log` (`id`, `saga_id` FK, `step_name`, `status`, `compensation_payload jsonb`, `executed_at`).
   - En cada **servicio participante** que publica eventos: `outbox` (`id`, `aggregate_type`, `aggregate_id`, `event_type`, `payload jsonb`, `topic`, `created_at`, `published_at`, `status`; índice sobre `status, created_at`) y `processed_message` (`message_id` PK, `consumer`, `processed_at`) para idempotencia.
-  - Cada tabla es propiedad de exactamente un microservicio; sepáralas con comentarios `-- BC-XX:` para que `scaffold-all-services.sh` las asigne al changelog Liquibase correcto (`00001_initial_schema.yaml` en el repo `<proyecto>-migrations` de Gitea).
+  - Cada tabla es propiedad de exactamente un microservicio; sepáralas con comentarios `-- BC-XX:` para que el changelog Liquibase correcto (`00001_initial_schema.yaml` en el repo `<proyecto>-migrations` de Gitea) la gestione.
   - Cada tabla vive en la BD del servicio propietario, nunca en una BD compartida.
 
 # REFERENCIA EN EL DOCUMENTO
@@ -575,10 +575,22 @@ La estructura de módulos Terraform generada es:
 | `modules/helm-infra` | Traefik (ingress), cert-manager | `infra` | 80, 443 |
 | `modules/helm-data` | PostgreSQL 16, MongoDB 7 (Bitnami), Strimzi operator + Kafka CR (KRaft) | `data`, `messaging` | — |
 | `modules/helm-identity` | Keycloak (conectado a PostgreSQL) | `identity` | 8082 |
-| `modules/helm-secrets` | HashiCorp Vault (standalone + init automático) | `secrets` | 8200 |
-| `modules/helm-cicd` | Gitea (Package Registry OCI), Jenkins, ArgoCD + AppProject | `cicd` | 3000, 8080, 8081 |
+| `modules/helm-secrets` | HashiCorp Vault (standalone + init + **unseal + KV v2 `secret/` + política `services-read` + kubernetes auth**) | `secrets` | 8200 |
+| `modules/helm-cicd` | Gitea (Package Registry OCI), Jenkins, ArgoCD + **AppProject + ApplicationSet** (Git generator sobre `helm-charts`) | `cicd` | 3000, 8080, 8081 |
 | `modules/helm-observability` | kube-prometheus-stack (Prometheus + Grafana + AlertManager), Loki, Promtail, Tempo | `observability` | 9090, 3001 |
 | `modules/helm-support` | Narayana LRA (`kubernetes_deployment`), WireMock (`kubernetes_deployment`) | `infra` | 50000, 9999 |
+
+**Lo que Terraform gestiona automáticamente sobre Vault:**
+- Unseal con clave de `vault-init.json`
+- Habilita KV v2 engine en `secret/`
+- Crea política `services-read` con acceso de lectura a `secret/data/*/*`
+- Habilita kubernetes auth method
+
+**Lo que gestiona el ApplicationSet de ArgoCD:**
+- Git generator apunta a `<proyecto>-helm-charts/charts/*` en Gitea
+- Auto-descubre servicios cuando se agregan charts al repo
+- Deploya en namespace `apps` con `values-<env>.yaml` por ambiente
+- `setup-cicd-pipeline.sh` sube las credenciales del repo a ArgoCD para que el git generator funcione
 
 Ambientes generados por el script en `terraform/environments/`:
 - `local.tfvars` — VM QEMU/KVM local (dev): contiene defaults para todas las contraseñas
@@ -697,19 +709,36 @@ Concluir:
 Indicar que la siguiente etapa del SDLC es:
 Desarrollo / Implementación.
 
-Incluir como paso operativo el aprovisionamiento de la infraestructura base:
+Incluir la secuencia completa de scripts de aprovisionamiento, en orden:
 
 ```bash
+# 1. Infraestructura base: K3s + Terraform + Helm (genera terraform/, instala todo)
 .claude/scripts/base-infrastructure-builder.sh \
-  --vm-ip <VPS_IP> \
-  --project <nombre-proyecto> \
-  --pg-prefix <prefijo> \
-  --mongo-prefix <prefijo> \
-  --services "<svc1>,<svc2>,..." \
-  --env local   # o --env prod para Oracle Cloud OCI
+  --vm-ip <VPS_IP> --project <nombre-proyecto> \
+  --pg-prefix <prefijo> --mongo-prefix <prefijo> \
+  --services "<svc1>,<svc2>,..." --env local
+
+# 2. Secrets por microservicio en HashiCorp Vault (auto-descubre backend/)
+.claude/scripts/create-all-secrets-vault.sh \
+  -P <nombre-proyecto> --vm-ip <VPS_IP> \
+  --pg-prefix <prefijo> --mongo-prefix <prefijo>
+
+# 3. Migraciones Liquibase por servicio (desde repo <proyecto>-migrations en Gitea)
+.claude/scripts/run-liquibase-migrations.sh \
+  --vm-ip <VPS_IP> --project <nombre-proyecto> \
+  --service <svc> --pg-prefix <prefijo> --gitea-clone
+
+# 4. Configurar CI/CD: Jenkins jobs + Gitea webhooks + ArgoCD credentials
+.claude/scripts/setup-cicd-pipeline.sh \
+  -P <nombre-proyecto> -S "<svc1>,<svc2>,..." \
+  --vm-ip <VPS_IP> --env local
+
+# 5. Verificar el ambiente completo (health checks + tabla de endpoints)
+.claude/scripts/init-dev-environment.sh \
+  -P <nombre-proyecto> --vm-ip <VPS_IP>
 ```
 
-El script genera la carpeta `terraform/` completa, instala K3s, despliega todos los servicios via Terraform + provider Helm, y ejecuta los pasos post-apply (bases de datos, Gitea, Jenkins Shared Library). Los módulos opcionales se controlan con `--no-lra`, `--no-wiremock`, `--no-loki`, `--no-tempo`.
+Los módulos opcionales de `base-infrastructure-builder.sh` se controlan con `--no-lra`, `--no-wiremock`, `--no-loki`, `--no-tempo`.
 
 ---
 

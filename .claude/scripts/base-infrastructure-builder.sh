@@ -484,6 +484,50 @@ TFEOF
 variable "kubeconfig_path" { type = string }
 TFEOF
 
+  # Script de post-init de Vault (unseal + KV v2 + política base)
+  # Se genera como archivo separado para evitar quoting anidado en el null_resource
+  cat > "$TF_ROOT/modules/helm-secrets/vault-post-init.sh" << 'BASH'
+#!/usr/bin/env bash
+# vault-post-init.sh — Unseal Vault, habilita KV v2, crea política base de servicios
+# Ejecutado por Terraform null_resource después de vault_init
+set -euo pipefail
+KUBECONFIG_PATH="$1"
+INIT_FILE="${2:-vault-init.json}"
+
+if [[ ! -f "$INIT_FILE" ]]; then
+  echo "[SKIP] $INIT_FILE no encontrado — Vault ya configurado o unseal manual requerido"
+  exit 0
+fi
+
+UNSEAL_KEY=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['unseal_keys_b64'][0])" 2>/dev/null \
+  || jq -r '.unseal_keys_b64[0]' "$INIT_FILE" 2>/dev/null || true)
+ROOT_TOKEN=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['root_token'])" 2>/dev/null \
+  || jq -r '.root_token' "$INIT_FILE" 2>/dev/null || true)
+
+[[ -z "$UNSEAL_KEY" || -z "$ROOT_TOKEN" ]] && { echo "[SKIP] Claves no legibles"; exit 0; }
+
+echo "[INFO] Unsealing Vault..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" exec -n secrets vault-0 -- \
+  vault operator unseal "$UNSEAL_KEY" 2>/dev/null || echo "[INFO] Ya estaba unsealed"
+
+echo "[INFO] Habilitando KV v2 en secret/..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" exec -n secrets vault-0 -- \
+  sh -c "VAULT_TOKEN=$ROOT_TOKEN vault secrets enable -path=secret kv-v2 2>/dev/null \
+    || echo '[SKIP] KV v2 ya habilitado'"
+
+echo "[INFO] Creando política services-read..."
+printf 'path "secret/data/*/*" { capabilities = ["read"] }\npath "secret/metadata/*/*" { capabilities = ["list","read"] }\n' \
+  | kubectl --kubeconfig="$KUBECONFIG_PATH" exec -i -n secrets vault-0 -- \
+    sh -c "VAULT_TOKEN=$ROOT_TOKEN vault policy write services-read -"
+
+echo "[INFO] Habilitando auth method kubernetes..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" exec -n secrets vault-0 -- \
+  sh -c "VAULT_TOKEN=$ROOT_TOKEN vault auth enable kubernetes 2>/dev/null \
+    || echo '[SKIP] kubernetes auth ya habilitado'"
+
+echo "[OK] Vault: unsealed + KV v2 secret/ + policy services-read + kubernetes auth"
+BASH
+
   cat > "$TF_ROOT/modules/helm-secrets/main.tf" << 'TFEOF'
 resource "helm_release" "vault" {
   name       = "vault"
@@ -520,6 +564,8 @@ resource "helm_release" "vault" {
   YAML
   ]
 }
+
+# Inicializa Vault (genera vault-init.json con unseal key + root token)
 resource "null_resource" "vault_init" {
   depends_on = [helm_release.vault]
   provisioner "local-exec" {
@@ -537,6 +583,15 @@ resource "null_resource" "vault_init" {
   }
   triggers = { vault_version = helm_release.vault.version }
 }
+
+# Unseal + habilitar KV v2 + política base de servicios + kubernetes auth
+resource "null_resource" "vault_setup" {
+  depends_on = [null_resource.vault_init]
+  provisioner "local-exec" {
+    command = "bash '${path.module}/vault-post-init.sh' '${var.kubeconfig_path}' vault-init.json"
+  }
+  triggers = { vault_init_id = null_resource.vault_init.id }
+}
 TFEOF
 
   # ── modules/helm-cicd ────────────────────────────────────────────────────
@@ -549,7 +604,7 @@ variable "jenkins_admin_password" { type = string; sensitive = true }
 variable "pg_admin_password"      { type = string; sensitive = true }
 TFEOF
 
-  # Plantilla AppProject con placeholders sustituidos por sed en null_resource
+  # Plantilla AppProject
   cat > "$TF_ROOT/modules/helm-cicd/argocd-appproject.yaml.tpl" << 'YAML'
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
@@ -568,6 +623,51 @@ spec:
   clusterResourceWhitelist:
     - group: '*'
       kind: '*'
+YAML
+
+  # Plantilla ApplicationSet — Git generator sobre helm-charts repo
+  # setup-cicd-pipeline.sh agrega entradas en charts/<servicio>/values-<env>.yaml
+  cat > "$TF_ROOT/modules/helm-cicd/argocd-applicationset.yaml.tpl" << 'YAML'
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: __PROJECT__-services
+  namespace: cicd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - git:
+        repoURL: 'http://__VM_IP__:3000/__PROJECT__/__PROJECT__-helm-charts.git'
+        revision: main
+        directories:
+          - path: 'charts/*'
+  template:
+    metadata:
+      name: '__PROJECT__-{{.path.basename}}'
+    spec:
+      project: __PROJECT__
+      source:
+        repoURL: 'http://__VM_IP__:3000/__PROJECT__/__PROJECT__-helm-charts.git'
+        targetRevision: main
+        path: '{{.path.path}}'
+        helm:
+          valueFiles:
+            - values-__ENV__.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: apps
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 10s
+            factor: 2
 YAML
 
   cat > "$TF_ROOT/modules/helm-cicd/main.tf" << 'TFEOF'
@@ -636,13 +736,13 @@ resource "helm_release" "argocd" {
   namespace  = "cicd"
   wait       = true
   timeout    = 600
-  set { name = "server.service.type";              value = "NodePort" }
-  set { name = "server.service.nodePorts.http";    value = "8081" }
-  set { name = "server.extraArgs";                 value = "{--insecure}" }
-  set { name = "redis.enabled";                    value = "true" }
-  set { name = "repoServer.resources.requests.memory"; value = "128Mi" }
+  set { name = "server.service.type";                   value = "NodePort" }
+  set { name = "server.service.nodePorts.http";         value = "8081" }
+  set { name = "server.extraArgs";                      value = "{--insecure}" }
+  set { name = "redis.enabled";                         value = "true" }
+  set { name = "repoServer.resources.requests.memory";  value = "128Mi" }
 }
-# AppProject aplicado post-deploy via kubectl + sed (sustituye __PROJECT__ y __VM_IP__)
+# AppProject — sustituye __PROJECT__ y __VM_IP__ via sed
 resource "null_resource" "argocd_appproject" {
   depends_on = [helm_release.argocd]
   provisioner "local-exec" {
@@ -655,6 +755,20 @@ resource "null_resource" "argocd_appproject" {
     CMD
   }
   triggers = { project = var.project; argocd_v = helm_release.argocd.version }
+}
+# ApplicationSet — Git generator: auto-descubre servicios desde charts/ en helm-charts repo
+resource "null_resource" "argocd_applicationset" {
+  depends_on = [null_resource.argocd_appproject]
+  provisioner "local-exec" {
+    command = <<-CMD
+      sed -e 's/__PROJECT__/${var.project}/g' \
+          -e 's/__VM_IP__/${var.vm_ip}/g' \
+          -e 's/__ENV__/${var.env}/g' \
+          '${path.module}/argocd-applicationset.yaml.tpl' \
+      | kubectl --kubeconfig='${var.kubeconfig_path}' apply -f -
+    CMD
+  }
+  triggers = { project = var.project; env = var.env; argocd_v = helm_release.argocd.version }
 }
 TFEOF
 

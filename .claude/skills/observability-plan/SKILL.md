@@ -22,7 +22,7 @@ El framework SDLC usa por defecto el siguiente stack, desplegado via Helm en K3s
 | Instrumentación | Micrometer + Spring Boot Actuator | dependencia Gradle/Maven |
 | Agente OTEL | OpenTelemetry Java Agent | javaagent en contenedor |
 
-El script de despliegue es: `.claude/scripts/setup-observability.sh`
+El stack de observabilidad se despliega automáticamente por el módulo `modules/helm-observability` de Terraform, invocado por `.claude/scripts/base-infrastructure-builder.sh`. No existe un `setup-observability.sh` separado — todo es gestionado por `helm_release` en Terraform.
 
 # OBJETIVO
 
@@ -137,9 +137,10 @@ Checklist de lo que cada microservicio debe implementar:
 
 ## 10. Próximos Pasos
 
-- Ejecutar: `.claude/scripts/setup-observability.sh --vm-ip <IP> --project <proyecto>`
-- Importar dashboard Spring Boot ID 4701 desde grafana.com.
-- Configurar notificaciones AlertManager (email / Slack webhook).
+- El stack de observabilidad ya está desplegado por `base-infrastructure-builder.sh` (módulo `helm-observability`). No es necesario ejecutar un script separado.
+- Verificar que todos los pods están Running: `init-dev-environment.sh -P <proyecto> --vm-ip <IP>`
+- Importar dashboard Spring Boot ID 4701 desde grafana.com en Grafana (`http://VPS_IP:3001`).
+- Configurar notificaciones AlertManager (email / Slack webhook) editando `values` en el módulo `helm-observability` de Terraform.
 
 ---
 
@@ -150,7 +151,7 @@ Checklist de lo que cada microservicio debe implementar:
 - Las expresiones PromQL deben usar el label `job` con el nombre del microservicio.
 - No inventar métricas ni alertas genéricas — anclarlas al dominio del proyecto.
 - Mantener snippets de configuración mínimos y funcionales.
-- No incluir configuración exhaustiva de infraestructura (eso ya está en setup-observability.sh).
+- No incluir configuración exhaustiva de infraestructura — el despliegue ya lo hace el módulo `modules/helm-observability` de Terraform vía `base-infrastructure-builder.sh`.
 
 # SALIDA
 
