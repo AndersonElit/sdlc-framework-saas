@@ -32,6 +32,7 @@
 #   --no-lra                  Omite Narayana LRA
 #   --no-wiremock             Omite WireMock
 #   --no-kong                 Omite Kong Gateway (y su integración con Keycloak)
+#   --no-minio                Omite MinIO (almacenamiento de objetos S3-compatible)
 #   --no-loki                 Omite Loki/Promtail
 #   --no-tempo                Omite Grafana Tempo
 #   --skip-k3s                K3s ya instalado
@@ -73,6 +74,7 @@ INSTALL_WIREMOCK=true
 INSTALL_LOKI=true
 INSTALL_TEMPO=true
 INSTALL_KONG=true
+INSTALL_MINIO=true
 SKIP_K3S=false
 SKIP_TF=false
 SKIP_DB=false
@@ -97,6 +99,7 @@ while [[ $# -gt 0 ]]; do
     --no-lra)          INSTALL_LRA=false;   shift   ;;
     --no-wiremock)     INSTALL_WIREMOCK=false; shift ;;
     --no-kong)         INSTALL_KONG=false;  shift   ;;
+    --no-minio)        INSTALL_MINIO=false; shift   ;;
     --no-loki)         INSTALL_LOKI=false;  shift   ;;
     --no-tempo)        INSTALL_TEMPO=false; shift   ;;
     --skip-k3s)        SKIP_K3S=true;       shift   ;;
@@ -191,6 +194,8 @@ variable "install_loki"             { type = bool; default = true }
 variable "install_tempo"            { type = bool; default = true }
 variable "install_kong"             { type = bool; default = true }
 variable "keycloak_realm"           { type = string; default = "" }
+variable "minio_root_password"       { type = string; sensitive = true; default = "changeme_minio" }
+variable "install_minio"             { type = bool; default = true }
 TFEOF
 
   # ── main.tf ──────────────────────────────────────────────────────────────────
@@ -200,8 +205,11 @@ module "namespaces" {
 }
 
 module "helm_infra" {
-  source     = "./modules/helm-infra"
-  depends_on = [module.namespaces]
+  source              = "./modules/helm-infra"
+  depends_on          = [module.namespaces]
+  project             = var.project
+  install_minio       = var.install_minio
+  minio_root_password = var.minio_root_password
 }
 
 module "helm_data" {
@@ -278,7 +286,9 @@ output "wiremock_url"    { value = var.install_wiremock ? "http://${var.vm_ip}:9
 output "kafka_bootstrap" { value = "kafka-kafka-bootstrap.messaging.svc.cluster.local:9092" }
 output "otel_grpc"       { value = var.install_tempo ? "tempo.observability.svc.cluster.local:4317" : "disabled" }
 output "kong_proxy_url"  { value = var.install_kong ? "http://${var.vm_ip}:8000" : "disabled" }
-output "kong_admin_url"  { value = var.install_kong ? "kong-kong-admin.gateway.svc.cluster.local:8001 (ClusterIP)" : "disabled" }
+output "kong_admin_url"    { value = var.install_kong  ? "kong-kong-admin.gateway.svc.cluster.local:8001 (ClusterIP)" : "disabled" }
+output "minio_api_url"     { value = var.install_minio ? "http://${var.vm_ip}:9000" : "disabled" }
+output "minio_console_url" { value = var.install_minio ? "http://${var.vm_ip}:9001" : "disabled" }
 TFEOF
 
   # ── environments/local.tfvars ─────────────────────────────────────────────
@@ -295,6 +305,8 @@ keycloak_admin_password = "changeme_kc_admin"
 gitea_admin_password    = "changeme_gitea_admin"
 jenkins_admin_password  = "changeme_jenkins_admin"
 grafana_admin_password  = "changeme_grafana_admin"
+minio_root_password     = "changeme_minio"
+install_minio           = true
 TFEOF
 
   cat > "$TF_ROOT/environments/prod.tfvars" << 'TFEOF'
@@ -319,6 +331,7 @@ install_wiremock = ${INSTALL_WIREMOCK}
 install_loki     = ${INSTALL_LOKI}
 install_tempo    = ${INSTALL_TEMPO}
 install_kong     = ${INSTALL_KONG}
+install_minio    = ${INSTALL_MINIO}
 keycloak_realm   = "${PROJECT}"
 TFEOF
 
@@ -339,7 +352,9 @@ TFEOF
 
   # ── modules/helm-infra ────────────────────────────────────────────────────
   cat > "$TF_ROOT/modules/helm-infra/variables.tf" << 'TFEOF'
-# Sin variables — configuración fija de red
+variable "project"             { type = string }
+variable "install_minio"       { type = bool;   default = true }
+variable "minio_root_password" { type = string; sensitive = true; default = "changeme_minio" }
 TFEOF
 
   cat > "$TF_ROOT/modules/helm-infra/main.tf" << 'TFEOF'
@@ -367,6 +382,34 @@ resource "helm_release" "cert_manager" {
   timeout    = 180
   set { name = "installCRDs";                    value = "true" }
   set { name = "resources.requests.memory";      value = "64Mi" }
+}
+resource "helm_release" "minio" {
+  count      = var.install_minio ? 1 : 0
+  name       = "minio"
+  repository = "https://charts.bitnami.com/bitnami"
+  chart      = "minio"
+  version    = "14.7.14"
+  namespace  = "infra"
+  wait       = true
+  timeout    = 300
+  set           { name = "auth.rootUser";                value = "minioadmin" }
+  set_sensitive { name = "auth.rootPassword";            value = var.minio_root_password }
+  set           { name = "mode";                         value = "standalone" }
+  set           { name = "persistence.size";             value = "10Gi" }
+  set           { name = "service.type";                 value = "NodePort" }
+  set           { name = "service.nodePorts.api";        value = "9000" }
+  set           { name = "service.nodePorts.console";    value = "9001" }
+  set           { name = "resources.requests.memory";    value = "256Mi" }
+  set           { name = "resources.requests.cpu";       value = "100m" }
+  values = [<<-YAML
+    provisioning:
+      enabled: true
+      buckets:
+        - name: "${var.project}-reports"
+          region: us-east-1
+          versioning: false
+  YAML
+  ]
 }
 TFEOF
 
@@ -1323,6 +1366,8 @@ print_summary() {
   log "  Grafana:     http://$VM_IP:3001"
   log "  Prometheus:  http://$VM_IP:9090"
   [[ "$INSTALL_KONG" == true ]]     && log "  Kong Proxy:  http://$VM_IP:8000  (API gateway → servicios)"
+  [[ "$INSTALL_MINIO" == true ]]    && log "  MinIO API:   http://$VM_IP:9000  (S3-compatible; bucket: $PROJECT-reports)"
+  [[ "$INSTALL_MINIO" == true ]]    && log "  MinIO UI:    http://$VM_IP:9001  (minioadmin / changeme_minio)"
   [[ "$INSTALL_LRA" == true ]]      && log "  LRA:         http://$VM_IP:50000"
   [[ "$INSTALL_WIREMOCK" == true ]] && log "  WireMock:    http://$VM_IP:9999"
   log ""

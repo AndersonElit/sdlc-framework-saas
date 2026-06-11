@@ -138,38 +138,39 @@ def build_files(root: Path, svc: str, pkg: str,
 # .env
 # --------------------------------------------------------------------------- #
 def dotenv_files(root: Path, report_role: str | None = None,
-                 source: str = "mongo", pg_db_prefix: str = "") -> None:
+                 source: str = "mongo", pg_db_prefix: str = "", org: str = "myproject") -> None:
     # BD del read model CQRS (PostgreSQL): <prefix>_readmodel si hay prefijo.
     readmodel_db = f"{pg_db_prefix}_readmodel" if pg_db_prefix else "readmodel_db"
 
     if report_role is None:
         content = (
-            "R2_ACCOUNT_ID=\n"
-            "R2_ACCESS_KEY_ID=\n"
-            "R2_SECRET_ACCESS_KEY=\n"
+            "STORAGE_ENDPOINT=\n"
+            "STORAGE_ACCESS_KEY=\n"
+            "STORAGE_SECRET_KEY=\n"
         )
     else:
         content = (
-            "# --- AWS / S3 (floci en dev, AWS real en staging/prod) ---\n"
-            "AWS_ENDPOINT_URL=${FLOCI_ENDPOINT:-http://localhost:4566}\n"
-            "AWS_ACCESS_KEY_ID=test\n"
-            "AWS_SECRET_ACCESS_KEY=test\n"
-            "AWS_REGION=us-east-1\n"
-            "REPORT_BUCKET=reports\n"
-            "# --- Kafka (VPS nativo) ---\n"
-            "KAFKA_BOOTSTRAP_SERVERS=${VPS_IP:-localhost}:29092\n"
+            "# --- Almacenamiento de objetos S3-compatible ---\n"
+            "# Dev:  MinIO en K3s  (http://minio.infra.svc.cluster.local:9000)\n"
+            "# Prod: OCI Object Storage (https://namespace.compat.objectstorage.region.oraclecloud.com)\n"
+            "STORAGE_ENDPOINT=${STORAGE_ENDPOINT:-http://minio.infra.svc.cluster.local:9000}\n"
+            "STORAGE_ACCESS_KEY=${STORAGE_ACCESS_KEY:-minioadmin}\n"
+            "STORAGE_SECRET_KEY=${STORAGE_SECRET_KEY:-changeme_minio}\n"
+            f"REPORT_BUCKET=${{REPORT_BUCKET:-{org}-reports}}\n"
+            "# --- Kafka (K3s via Strimzi) ---\n"
+            "KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.messaging.svc.cluster.local:9092\n"
         )
         if report_role == "extraction" and source == "mongo":
             content += (
-                "# --- Read model CQRS (MongoDB nativo en VPS) ---\n"
-                "MONGO_URI=mongodb://${VPS_IP:-localhost}:27017\n"
+                "# --- Read model CQRS (MongoDB en K3s) ---\n"
+                "MONGO_URI=mongodb://mongodb.data.svc.cluster.local:27017\n"
                 "MONGO_READ_DB=readmodel\n"
                 "MONGO_READ_COLLECTION=ventas\n"
             )
         elif report_role == "extraction" and source == "jdbc":
             content += (
-                "# --- Read model CQRS (PostgreSQL nativo en VPS) ---\n"
-                f"JDBC_URL=jdbc:postgresql://${{VPS_IP:-localhost}}:5432/{readmodel_db}\n"
+                "# --- Read model CQRS PostgreSQL (<prefix>_readmodel — NO usar BD operacional) ---\n"
+                f"JDBC_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{readmodel_db}\n"
                 "JDBC_TABLE=ventas\n"
                 "JDBC_USER=app\n"
                 "JDBC_PASSWORD=app\n"
@@ -478,64 +479,62 @@ spec:
 def get_secrets_script_content(svc: str, report_role: str | None,
                                 source: str, org: str = "myproject",
                                 pg_db_prefix: str = "") -> str:
-    import json as _json
-
     # BD PostgreSQL del read model CQRS: <prefix>_readmodel
     readmodel_db = f"{pg_db_prefix}_readmodel" if pg_db_prefix else "readmodel_db"
+    svc_slug = svc.replace("-", "_")
 
     if report_role is None:
-        secret: dict = {
-            "R2_ACCOUNT_ID": "",
-            "R2_ACCESS_KEY_ID": "",
-            "R2_SECRET_ACCESS_KEY": "",
-        }
+        kvpairs = [
+            "STORAGE_ENDPOINT=http://minio.infra.svc.cluster.local:9000",
+            "STORAGE_ACCESS_KEY=minioadmin",
+            "STORAGE_SECRET_KEY=changeme_minio",
+        ]
     else:
-        secret = {
-            "AWS_ENDPOINT_URL": "http://localhost:4566",
-            "AWS_ACCESS_KEY_ID": "test",
-            "AWS_SECRET_ACCESS_KEY": "test",
-            "AWS_REGION": "us-east-1",
-            "REPORT_BUCKET": "reports",
-            "KAFKA_BOOTSTRAP_SERVERS": "localhost:9092",
-        }
+        kvpairs = [
+            "STORAGE_ENDPOINT=http://minio.infra.svc.cluster.local:9000",
+            "STORAGE_ACCESS_KEY=minioadmin",
+            "STORAGE_SECRET_KEY=changeme_minio",
+            f"REPORT_BUCKET={org}-reports",
+            "KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.messaging.svc.cluster.local:9092",
+        ]
         if report_role == "extraction" and source == "mongo":
-            secret.update({
-                "MONGO_URI": "mongodb://localhost:27017",
-                "MONGO_READ_DB": "readmodel",
-                "MONGO_READ_COLLECTION": "ventas",
-            })
+            kvpairs += [
+                "MONGO_URI=mongodb://mongodb.data.svc.cluster.local:27017",
+                "MONGO_READ_DB=readmodel",
+                "MONGO_READ_COLLECTION=ventas",
+            ]
         elif report_role == "extraction" and source == "jdbc":
-            secret.update({
-                "JDBC_URL": f"jdbc:postgresql://localhost:5432/{readmodel_db}",
-                "JDBC_TABLE": "ventas",
-                "JDBC_USER": "app",
-                "JDBC_PASSWORD": "app",
-            })
+            kvpairs += [
+                f"JDBC_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{readmodel_db}",
+                "JDBC_TABLE=ventas",
+                f"JDBC_USER={readmodel_db}_user",
+                f"JDBC_PASSWORD=changeme_{svc_slug}",
+            ]
 
-    secret_json = _json.dumps(secret)
+    kvpairs_str = " ".join(f'"{kv}"' for kv in kvpairs)
+
     return f"""\
 #!/usr/bin/env bash
-# Crea (o actualiza) el secret de desarrollo en floci (emulador AWS).
-# Requiere que floci esté corriendo en http://localhost:4566.
+# Crea/actualiza el secret de desarrollo en HashiCorp Vault (K3s).
+# Uso: KUBECONFIG=~/.kube/config-{org}-local bash scripts/create-secrets-dev.sh
+# Requiere que Vault esté unsealed y vault-init.json esté disponible.
 
-SECRET_NAME="{org}/dev/{svc}"
-ENDPOINT="http://localhost:4566"
-REGION="us-east-1"
+set -euo pipefail
+KUBECONFIG="${{KUBECONFIG:-$HOME/.kube/config-{org}-local}}"
+SECRET_PATH="{org}/dev/{svc}"
+INIT_FILE="${{VAULT_INIT_FILE:-./vault-init.json}}"
 
-if aws --endpoint-url="$ENDPOINT" secretsmanager describe-secret \\
-       --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
-    aws --endpoint-url="$ENDPOINT" secretsmanager put-secret-value \\
-        --secret-id "$SECRET_NAME" \\
-        --secret-string '{secret_json}' \\
-        --region "$REGION"
-    echo "Secret actualizado: $SECRET_NAME"
-else
-    aws --endpoint-url="$ENDPOINT" secretsmanager create-secret \\
-        --name "$SECRET_NAME" \\
-        --secret-string '{secret_json}' \\
-        --region "$REGION"
-    echo "Secret creado: $SECRET_NAME"
+if [[ -f "$INIT_FILE" ]]; then
+    VAULT_TOKEN=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['root_token'])" 2>/dev/null \\
+        || jq -r '.root_token' "$INIT_FILE" 2>/dev/null)
 fi
+VAULT_TOKEN="${{VAULT_TOKEN:-${{VAULT_ROOT_TOKEN:-}}}}"
+[[ -z "$VAULT_TOKEN" ]] && {{ echo "ERROR: VAULT_TOKEN no disponible"; exit 1; }}
+
+kubectl --kubeconfig="$KUBECONFIG" exec -n secrets vault-0 -- \\
+    sh -c "VAULT_TOKEN=${{VAULT_TOKEN}} vault kv put secret/${{SECRET_PATH}} {kvpairs_str}"
+
+echo "Secret creado/actualizado: secret/${{SECRET_PATH}}"
 """
 
 
@@ -552,14 +551,16 @@ def _setup_gitea_repo(svc: str, root: Path, org: str = "myproject") -> None:
     import os
     vps_ip = os.environ.get("VPS_IP", "")
     gitea_host = f"http://{vps_ip}:3000" if vps_ip else "http://localhost:3000"
-    credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
+    gitea_user = os.environ.get("GITEA_USER", "gitea_admin")
+    gitea_pass = os.environ.get("GITEA_PASS", "changeme_gitea_admin")
+    credentials = base64.b64encode(f"{gitea_user}:{gitea_pass}".encode()).decode()
 
     try:
         urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
     except Exception:
         logger.warning(
-            "[Gitea] No activo en %s — pasar VPS_IP=<IP> o crear repo manualmente "
-            "tras correr base-infrastructure-builder.sh --vps-ip.", gitea_host
+            "[Gitea] No activo en %s — exportar VPS_IP=<IP> o crear repo manualmente "
+            "tras correr base-infrastructure-builder.sh.", gitea_host
         )
         return
 
@@ -598,7 +599,7 @@ def _setup_gitea_repo(svc: str, root: Path, org: str = "myproject") -> None:
         remote_url = f"{gitea_host}/{org}/{svc}.git"
         subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
         logger.info("[Gitea] Remote 'origin' → %s", remote_url)
-        push_url = remote_url.replace("http://", "http://gitea-admin:gitea-admin@", 1)
+        push_url = remote_url.replace("http://", f"http://{gitea_user}:{gitea_pass}@", 1)
         push = subprocess.run(["git", "push", push_url, "main"], cwd=root, capture_output=True)
         if push.returncode == 0:
             logger.info("[Gitea] Push a %s/%s completado (rama main).", org, svc)
@@ -609,59 +610,71 @@ def _setup_gitea_repo(svc: str, root: Path, org: str = "myproject") -> None:
 
 
 def _update_argocd_applicationset(svc: str, org: str = "myproject") -> None:
+    """Sube el Helm chart del batch job al repo <org>-helm-charts en Gitea.
+
+    El ApplicationSet de ArgoCD usa un Git generator que auto-descubre servicios
+    desde charts/ en el repo helm-charts. No se necesita actualizar YAML estáticos.
+    """
+    import base64 as _b64
+    import json as _json
+    import urllib.error
+    import urllib.request
     import os as _os
+
     _vps_ip = _os.environ.get("VPS_IP", "localhost")
     gitea_host = f"http://{_vps_ip}:3000"
-    repo_root = Path(__file__).parent.parent.parent
-    sentinel = "          # -- services managed by scaffold --\n"
-    entry = (
-        f"          - service: {svc}\n"
-        f"            repoURL: {gitea_host}/{org}/{svc}.git\n"
-        f"            revision: main\n"
-    )
-    for env in ("dev", "staging", "prod"):
-        appset = (
-            repo_root / "terraform" / "backend" / "environments" / env
-            / "argocd-bootstrap" / "applicationset.yaml"
+    gitea_user = _os.environ.get("GITEA_USER", "gitea_admin")
+    gitea_pass = _os.environ.get("GITEA_PASS", "changeme_gitea_admin")
+    credentials = _b64.b64encode(f"{gitea_user}:{gitea_pass}".encode()).decode()
+    helm_charts_repo = f"{org}-helm-charts"
+
+    try:
+        urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
+    except Exception:
+        logger.warning("[Gitea] No activo — subir manualmente chart a %s/charts/%s/", helm_charts_repo, svc)
+        return
+
+    for env in ("local", "dev", "prod"):
+        content = f"# values-{env}.yaml para {svc}\nimage:\n  repository: \"\"\n  tag: \"\"\n"
+        encoded = _b64.b64encode(content.encode()).decode()
+        sha = ""
+        file_path = f"charts/{svc}/values-{env}.yaml"
+        try:
+            req = urllib.request.Request(
+                f"{gitea_host}/api/v1/repos/{org}/{helm_charts_repo}/contents/{file_path}",
+                headers={"Authorization": f"Basic {credentials}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                sha = _json.loads(r.read())["sha"]
+        except urllib.error.HTTPError:
+            pass
+        payload: dict = {"message": f"ci: scaffold {svc} helm chart ({env})", "content": encoded}
+        if sha:
+            payload["sha"] = sha
+        req = urllib.request.Request(
+            f"{gitea_host}/api/v1/repos/{org}/{helm_charts_repo}/contents/{file_path}",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}"},
+            method="PUT",
         )
-        if not appset.exists():
-            logger.debug("[ArgoCD] %s no encontrado, omitiendo", appset)
-            continue
-        content = appset.read_text()
-        if f"service: {svc}" in content:
-            logger.debug("[ArgoCD] '%s' ya existe en applicationset.yaml (%s)", svc, env)
-            continue
-        if sentinel not in content:
-            logger.warning("[ArgoCD] Sentinel no encontrado en %s", appset)
-            continue
-        appset.write_text(content.replace(sentinel, sentinel + entry))
-        logger.info("[ArgoCD] '%s' añadido a applicationset.yaml (%s)", svc, env)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            logger.debug("[Gitea helm-charts] %s subido.", file_path)
+        except urllib.error.HTTPError as e:
+            logger.warning("[Gitea helm-charts] No se pudo subir %s: HTTP %s", file_path, e.code)
+
+    logger.info("[ArgoCD] Helm chart '%s' subido a %s/charts/%s/ — ApplicationSet lo sincronizará.", svc, helm_charts_repo, svc)
 
 
 def _update_terraform_services(svc: str) -> None:
-    repo_root = Path(__file__).parent.parent.parent
-    pattern = re.compile(r'(services\s*=\s*\[)([^\]]*?)(\])')
-    for env in ("dev", "staging", "prod"):
-        main_tf = repo_root / "terraform" / "backend" / "environments" / env / "main.tf"
-        if not main_tf.exists():
-            logger.debug("[Terraform] %s no encontrado, omitiendo", main_tf)
-            continue
-        content = main_tf.read_text()
-        match = pattern.search(content)
-        if not match:
-            logger.warning("[Terraform] No se encontró 'services' en %s", main_tf)
-            continue
-        existing = [s.strip().strip('"') for s in match.group(2).split(',') if s.strip().strip('"')]
-        if svc in existing:
-            logger.info("[Terraform] '%s' ya existe en services (%s)", svc, env)
-            continue
-        existing.append(svc)
-        new_list = ", ".join(f'"{s}"' for s in existing)
-        new_content = (content[:match.start()]
-                       + f'{match.group(1)}{new_list}{match.group(3)}'
-                       + content[match.end():])
-        main_tf.write_text(new_content)
-        logger.info("[Terraform] Agregado '%s' a services en %s", svc, env)
+    """No-op: Terraform se genera en tiempo de ejecución por base-infrastructure-builder.sh.
+    Ejecutar init-databases.sh para crear la BD del servicio.
+    """
+    logger.info(
+        "[Terraform] Omitido — la infra se genera en runtime. "
+        "Ejecutar: .claude/scripts/init-databases.sh --service %s para crear la BD.",
+        svc
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -804,12 +817,14 @@ final case class ReportExtracted(
     validatedAt: String
 ) extends ReportEvent
 
+/** Un evento por formato: report-etl-service publica N mensajes (uno por formato pedido).
+ *  El Kafka Consumer lee el campo `format` y genera exactamente ese archivo. */
 final case class ReportProcessed(
     reportId: String,
     runId: String,
     reportType: String,
     processedParquetUri: String,
-    formats: List[String],
+    format: String,
     processedAt: String
 ) extends ReportEvent
 
@@ -955,8 +970,9 @@ class ReportTransformerFactory(registry: Map[ReportType, ReportTransformer]) {
 import com.example.__PKG__.domain.model.ReportType
 import com.example.__PKG__.domain.ports._
 
-/** MS2: resuelve el transformer por `reportType` vía factory, transforma el parquet `raw/`
- *  y materializa `processed/`, publicando `report.processed`. */
+/** MS2: resuelve el transformer por `reportType` vía factory, transforma el parquet `raw/`,
+ *  materializa `processed/` y publica UN evento por formato en `report.processed`.
+ *  El campo `format` (singular) permite que el Kafka Consumer genere exactamente ese archivo. */
 class ProcessReportUseCase(
     factory: ReportTransformerFactory,
     store: ParquetStorePort,
@@ -976,12 +992,15 @@ class ProcessReportUseCase(
       val raw = store.readRaw(rawUri)
       val processed = transformer.transform(raw)
       val uri = store.writeProcessed(reportType.value, reportId, processed)
-      val fmts = formats.map(f => "\\"" + f + "\\"").mkString(",")
-      val payload =
-        s"""{"reportId":"$reportId","runId":"$runId","reportType":"${reportType.value}",""" +
-        s""""processedParquetUri":"$uri","formats":[$fmts],""" +
-        s""""processedAt":"${java.time.Instant.now()}"}"""
-      events.publish(outTopic, reportId, payload)
+      val ts  = java.time.Instant.now().toString
+      // Un evento por formato: el Kafka Consumer lee el campo `format` y genera ese archivo.
+      formats.foreach { fmt =>
+        val payload =
+          s"""{"reportId":"$reportId","runId":"$runId","reportType":"${reportType.value}",""" +
+          s""""processedParquetUri":"$uri","format":"$fmt",""" +
+          s""""processedAt":"$ts"}"""
+        events.publish(outTopic, s"$reportId-$fmt", payload)
+      }
     } catch {
       case e: UnsupportedReportTypeException =>
         val payload =
@@ -1051,7 +1070,9 @@ def jdbc_source_adapter(root: Path, pkg: str) -> None:
 import com.example.__PKG__.domain.ports.SourceDataPort
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
-/** Adaptador de origen JDBC para proyectos SIN CQRS (alternativa a Mongo). */
+/** Lee el read model PostgreSQL CQRS (`<prefix>_readmodel`) — DS-CQRS-3.
+ *  NUNCA apunta a las BDs operacionales de los microservicios de dominio.
+ *  Variable JDBC_URL debe apuntar a `<prefix>_readmodel` (Database-per-Service del projection-service). */
 class SparkJdbcSourceAdapter(
     spark: SparkSession,
     url: String,
@@ -1079,7 +1100,9 @@ def s3_parquet_adapter(root: Path, pkg: str) -> None:
 import com.example.__PKG__.domain.ports.ParquetStorePort
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 
-/** Lee/escribe parquet en S3 (floci en dev, AWS real en prod). Layout §9.1.
+/** Lee/escribe parquet en almacenamiento de objetos S3-compatible.
+ *  Dev: MinIO en K3s (endpoint via STORAGE_ENDPOINT).
+ *  Prod: OCI Object Storage (compatible S3A via endpoint override) o AWS S3.
  *  Idempotente por `reportId` con sobrescritura determinista (DR-3). */
 class SparkS3ParquetAdapter(spark: SparkSession, bucket: String) extends ParquetStorePort {
 
@@ -1188,8 +1211,8 @@ class ReportExtractedConsumer(
     val reportId   = field(json, "reportId").getOrElse(UUID.randomUUID().toString)
     val runId      = field(json, "runId").getOrElse(UUID.randomUUID().toString)
     val rawUri     = field(json, "rawParquetUri").getOrElse("")
-    // Por defecto los 3 formatos; un proyecto puede derivarlos del catálogo.
-    val formats    = List("PDF", "XLS", "CSV")
+    // Formatos a generar: un evento por formato → "format" singular en cada mensaje Kafka.
+    val formats = List("XLS", "CSV")  // ajustar si el catálogo define otros formatos
     useCase.execute(ReportType.fromString(reportType), reportId, runId, rawUri, formats)
   }
 
@@ -1214,13 +1237,15 @@ def report_batch_main(root: Path, svc: str, pkg: str, report_role: str,
     val builder = SparkSession.builder
       .appName("__SVC__")
       .master(sys.env.getOrElse("SPARK_MASTER", "local[*]"))
-    val endpoint = sys.env.getOrElse("AWS_ENDPOINT_URL", "")
+    // Almacenamiento de objetos S3-compatible: MinIO en dev (K3s), OCI Object Storage en prod.
+    // STORAGE_ENDPOINT vacío → usa AWS S3 real (o provider nativo si OCI SDK configurado).
+    val endpoint = sys.env.getOrElse("STORAGE_ENDPOINT", "")
     val spark = builder.getOrCreate()
     val hc = spark.sparkContext.hadoopConfiguration
     if (endpoint.nonEmpty) hc.set("fs.s3a.endpoint", endpoint)
     hc.set("fs.s3a.path.style.access", "true")
-    hc.set("fs.s3a.access.key", sys.env.getOrElse("AWS_ACCESS_KEY_ID", "test"))
-    hc.set("fs.s3a.secret.key", sys.env.getOrElse("AWS_SECRET_ACCESS_KEY", "test"))
+    hc.set("fs.s3a.access.key", sys.env.getOrElse("STORAGE_ACCESS_KEY", "minioadmin"))
+    hc.set("fs.s3a.secret.key", sys.env.getOrElse("STORAGE_SECRET_KEY", "changeme_minio"))
     hc.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     spark
   }
@@ -1424,7 +1449,7 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
     types = [t.strip() for t in report_types.split(",") if t.strip()]
 
     build_files(root, service_name, pkg, report_role, source)
-    dotenv_files(root, report_role, source, pg_db_prefix)
+    dotenv_files(root, report_role, source, pg_db_prefix, org)
     dockerfile_files(root, service_name)
 
     if report_role is None:
@@ -1474,7 +1499,8 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
  1. Entra al directorio:
       cd {abs_root}
 
- 2. Crea el secret en floci (emulador AWS local):
+ 2. Crea el secret en Vault (K3s local):
+      export VAULT_TOKEN=$(jq -r '.root_token' ./vault-init.json)
       bash scripts/create-secrets-dev.sh""")
 
     if report_role is None:
@@ -1484,11 +1510,11 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
 """)
     else:
         if report_role == "extraction" and source == "mongo":
-            print("    (requiere floci + Kafka + MongoDB corriendo)")
+            print("    (requiere K3s corriendo con MongoDB y Kafka via Strimzi)")
         elif report_role == "extraction":
-            print("    (requiere floci + Kafka + PostgreSQL corriendo)")
+            print("    (requiere K3s corriendo con PostgreSQL read model y Kafka via Strimzi)")
         else:
-            print("    (requiere floci + Kafka corriendo)")
+            print("    (requiere K3s corriendo con Kafka via Strimzi)")
         if report_role == "extraction":
             print(f'\n 3. Ejecutar extracción:\n      sbt "entryPoints/run --reportType ventas-mensual"')
             print(f"    → valida esquema, escribe raw/ y publica '{kafka_out}'")

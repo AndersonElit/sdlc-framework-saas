@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Genera la capa serverless de generación de formatos del subsistema de reportería.
+"""Genera la capa de formatos del subsistema de reportería.
 
-PLAN-reporteria-spark-etl.md §7.2: un *Lambda Kafka Consumer* consume `report.processed`
-y publica a EventBridge (PutEvents, un evento por formato); una *rule* por formato enruta a
-la lambda PDF/XLS/CSV correspondiente, que lee `processed/` parquet y escribe `output/<formato>/`.
+Un único *Kafka Consumer* (OCI Functions en prod / servicio en VPS dev) consume el topic
+`ReportParquetGenerated` (report.processed), lee el parquet del almacenamiento de objetos,
+genera los formatos pedidos (csv, xls) y escribe los archivos en `output/<fmt>/`.
 
-El mismo Terraform aplica en dev (provider AWS apuntando a floci, :4566) y en staging/prod
-(AWS real); solo cambian las variables de endpoint/credenciales.
+**SIN EventBridge intermedio** — el consumer genera todos los formatos directamente.
+
+Almacenamiento:
+  Dev:  MinIO en K3s (STORAGE_ENDPOINT=http://minio.infra.svc.cluster.local:9000)
+  Prod: OCI Object Storage (compatible S3A) o AWS S3
+
+Terraform genera:
+  - Lambda Kafka Consumer (única función, todos los formatos)
+  - Trigger Kafka (self-managed sobre Strimzi/MSK)
+  - IAM Role con permisos S3-compatible (sin EventBridge)
 """
 
 import argparse
@@ -16,13 +24,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-VALID_FORMATS = {"pdf", "xls", "csv"}
-
-RENDER_LIBS = {
-    "pdf": "reportlab",
-    "xls": "openpyxl",
-    "csv": "",  # stdlib
-}
+SUPPORTED_FORMATS = {"XLS", "CSV"}  # formatos inline en el handler; el campo `format` del evento los determina
 
 
 def write(root: Path, relative: str, content: str) -> None:
@@ -40,32 +42,61 @@ def _r(content: str, **kw: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Kafka consumer lambda
+# Kafka Consumer Lambda — genera TODOS los formatos directamente (sin EventBridge)
 # --------------------------------------------------------------------------- #
-def kafka_consumer_handler(root: Path, org: str, topic: str, formats: list[str]) -> None:
-    base = "terraform/backend/modules/reporting-lambdas/kafka-consumer"
-    write(root, f"{base}/handler.py", _r('''"""Lambda Kafka Consumer (DR-5).
+def kafka_consumer_handler(root: Path, org: str, topic: str) -> None:
+    """Genera el único Kafka Consumer Lambda.
 
-Consume `__TOPIC__` (trigger Kafka/MSK o poller) y traduce cada evento a EventBridge
-(PutEvents), emitiendo un evento `ReportFormatRequested` por cada formato solicitado.
-NO genera formatos: solo enruta (DR-5).
+    El evento consumido lleva el campo `format` (singular). El report-etl-service (Scala)
+    publica UN mensaje por formato — el consumer genera exactamente ese archivo.
+    Toda la lógica de generación está inline en este handler (sin Lambdas separadas).
+    """
+    base = "terraform/backend/modules/reporting-lambdas/kafka-consumer"
+
+    handler_py = _r('''"""Lambda Kafka Consumer — capa de formatos del subsistema de reportería.
+
+Consume el evento `ReportParquetGenerated` (topic: __TOPIC__).
+Cada mensaje lleva el campo `format` (singular: "CSV" o "XLS").
+El report-etl-service publica UN mensaje por formato; este consumer lo genera directamente.
+
+Flujo: Kafka __TOPIC__ → leer parquet → generar format → escribir output/<fmt>/...
+Errores → publica ReportETLFailed en Kafka (report.processing.failed).
+
+**SIN EventBridge intermedio. Lógica de generación inline en este handler.**
+Almacenamiento: MinIO (dev K3s) / OCI Object Storage (prod) via S3-compatible endpoint.
 """
 import json
 import os
+import io
+import csv
 import base64
+import logging
 
 import boto3
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+from openpyxl import Workbook
 
-EVENT_BUS = os.environ.get("EVENTBRIDGE_BUS", "__ORG__-report-bus")
-SOURCE = "__ORG__.reporting"
-DEFAULT_FORMATS = [__DEFAULT_FORMATS__]
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-_endpoint = os.environ.get("AWS_ENDPOINT_URL") or None
-events = boto3.client("events", endpoint_url=_endpoint)
+REPORT_BUCKET   = os.environ.get("REPORT_BUCKET",   "__ORG__-reports")
+KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-kafka-bootstrap.messaging.svc.cluster.local:9092")
+FAILED_TOPIC    = "report.processing.failed"
+DEFAULT_FORMAT  = "CSV"
+
+# Almacenamiento S3-compatible (MinIO dev / OCI prod / AWS S3)
+_endpoint = os.environ.get("STORAGE_ENDPOINT") or None
+s3 = boto3.client(
+    "s3",
+    endpoint_url=_endpoint,
+    aws_access_key_id=os.environ.get("STORAGE_ACCESS_KEY", "minioadmin"),
+    aws_secret_access_key=os.environ.get("STORAGE_SECRET_KEY", "changeme_minio"),
+)
 
 
 def _records(event):
-    """Soporta el envelope de trigger MSK/Kafka (event['records']) y la invocación directa."""
+    """Soporta el envelope de trigger MSK/Kafka (event[\'records\']) y la invocación directa."""
     if "records" in event:
         for _topic, msgs in event["records"].items():
             for m in msgs:
@@ -78,165 +109,115 @@ def _records(event):
         yield event
 
 
+def _s3fs():
+    return pafs.S3FileSystem(
+        endpoint_override=_endpoint,
+        scheme="http" if _endpoint else "https",
+        access_key=os.environ.get("STORAGE_ACCESS_KEY", "minioadmin"),
+        secret_key=os.environ.get("STORAGE_SECRET_KEY", "changeme_minio"),
+    )
+
+
+def _publish_failed(report_id: str, fmt: str, reason: str) -> None:
+    """Publica ReportETLFailed a Kafka (best-effort)."""
+    try:
+        from kafka import KafkaProducer
+        p = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        p.send(FAILED_TOPIC, key=f"{report_id}-{fmt}".encode(), value={
+            "reportId": report_id,
+            "stage": "format-generation",
+            "format": fmt,
+            "reason": reason,
+        })
+        p.flush()
+        p.close()
+    except Exception as exc:
+        logger.warning("No se pudo publicar ReportETLFailed: %s", exc)
+
+
 def handler(event, _context=None):
-    entries = []
+    results = []
+
     for msg in _records(event):
-        formats = msg.get("formats") or DEFAULT_FORMATS
-        for fmt in formats:
-            detail = {
-                "reportId": msg.get("reportId"),
-                "reportType": msg.get("reportType"),
-                "processedParquetUri": msg.get("processedParquetUri"),
-                "format": fmt.upper(),
-            }
-            entries.append({
-                "Source": SOURCE,
-                "DetailType": "ReportFormatRequested",
-                "Detail": json.dumps(detail),
-                "EventBusName": EVENT_BUS,
-            })
-    if entries:
-        events.put_events(Entries=entries)
-    return {"published": len(entries)}
-''', TOPIC=topic, ORG=org,
-        DEFAULT_FORMATS=", ".join(f'"{f.upper()}"' for f in formats)))
-    write(root, f"{base}/requirements.txt", "boto3\n")
+        report_id   = msg.get("reportId", "unknown")
+        report_type = msg.get("reportType", "report")
+        parquet_uri = msg.get("processedParquetUri") or msg.get("rawParquetUri", "")
+        fmt         = (msg.get("format") or DEFAULT_FORMAT).upper()  # singular del evento
+
+        if not parquet_uri:
+            logger.error("processedParquetUri vacío para reportId=%s", report_id)
+            _publish_failed(report_id, fmt, "processedParquetUri vacío")
+            continue
+
+        # ── Leer parquet desde almacenamiento de objetos ──────────────────────
+        try:
+            table = ds.dataset(parquet_uri, format="parquet", filesystem=_s3fs()).to_table()
+        except Exception as exc:
+            logger.error("Error leyendo parquet %s: %s", parquet_uri, exc)
+            _publish_failed(report_id, fmt, f"Error leyendo parquet: {exc}")
+            continue
+
+        # ── Generar formato (lógica inline según campo `format`) ──────────────
+        try:
+            if fmt == "CSV":
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow(table.column_names)
+                for row in zip(*[col.to_pylist() for col in table.columns]):
+                    writer.writerow(row)
+                key = f"output/csv/{report_type}/{report_id}.csv"
+                s3.put_object(
+                    Bucket=REPORT_BUCKET,
+                    Key=key,
+                    Body=buf.getvalue().encode("utf-8"),
+                    ContentType="text/csv",
+                )
+
+            elif fmt == "XLS":
+                wb = Workbook()
+                ws = wb.active
+                ws.title = report_type[:31]
+                ws.append(table.column_names)
+                for row in zip(*[col.to_pylist() for col in table.columns]):
+                    ws.append(list(row))
+                buf = io.BytesIO()
+                wb.save(buf)
+                key = f"output/xls/{report_type}/{report_id}.xlsx"
+                s3.put_object(
+                    Bucket=REPORT_BUCKET,
+                    Key=key,
+                    Body=buf.getvalue(),
+                    ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            else:
+                logger.warning("Formato no soportado: %s (soportados: CSV, XLS)", fmt)
+                _publish_failed(report_id, fmt, f"Formato no soportado: {fmt}")
+                continue
+
+            output_uri = f"s3://{REPORT_BUCKET}/{key}"
+            results.append({"format": fmt, "output": output_uri, "rows": table.num_rows})
+            logger.info("Generado %s → %s (%d filas)", fmt, output_uri, table.num_rows)
+
+        except Exception as exc:
+            logger.error("Error generando %s para reportId=%s: %s", fmt, report_id, exc)
+            _publish_failed(report_id, fmt, f"Error generando {fmt}: {exc}")
+
+    return {"generated": len(results), "outputs": results}
+''', TOPIC=topic, ORG=org)
+
+    write(root, f"{base}/handler.py", handler_py)
+    write(root, f"{base}/requirements.txt",
+          "boto3\npyarrow\nopenpyxl\nkafka-python\n")
 
 
 # --------------------------------------------------------------------------- #
-# Format lambdas (pdf / xls / csv)
+# Terraform — Lambda + Kafka trigger (sin EventBridge)
 # --------------------------------------------------------------------------- #
-def _format_handler_body(fmt: str, org: str) -> str:
-    common_head = '''"""Lambda de formato __FMT_UP__ (DR-6).
-
-Disparada por una rule de EventBridge (detail.format = __FMT_UP__). Lee el parquet
-`processedParquetUri` y escribe el archivo en `output/__FMT__/<reportType>/<reportId>.__EXT__`.
-"""
-import json
-import os
-import io
-
-import boto3
-import pyarrow.parquet as pq
-import pyarrow.dataset as ds
-
-REPORT_BUCKET = os.environ.get("REPORT_BUCKET", "__ORG__-reports")
-_endpoint = os.environ.get("AWS_ENDPOINT_URL") or None
-s3 = boto3.client("s3", endpoint_url=_endpoint)
-
-
-def _read_table(uri: str):
-    """Lee un parquet (prefijo S3) como tabla pyarrow vía s3fs/pyarrow dataset."""
-    dataset = ds.dataset(uri, format="parquet", filesystem=_s3_filesystem())
-    return dataset.to_table()
-
-
-def _s3_filesystem():
-    import pyarrow.fs as pafs
-    return pafs.S3FileSystem(endpoint_override=_endpoint, scheme="http" if _endpoint else "https")
-
-
-def _detail(event):
-    return event.get("detail", event)
-
-
-def _output_key(report_type: str, report_id: str) -> str:
-    return f"output/__FMT__/{report_type}/{report_id}.__EXT__"
-'''
-
-    if fmt == "csv":
-        render = '''
-
-def handler(event, _context=None):
-    d = _detail(event)
-    report_id = d["reportId"]
-    report_type = d.get("reportType", "report")
-    table = _read_table(d["processedParquetUri"])
-
-    import csv
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(table.column_names)
-    for row in zip(*[col.to_pylist() for col in table.columns]):
-        writer.writerow(row)
-
-    key = _output_key(report_type, report_id)
-    s3.put_object(Bucket=REPORT_BUCKET, Key=key, Body=buf.getvalue().encode("utf-8"))
-    return {"output": f"s3://{REPORT_BUCKET}/{key}", "rows": table.num_rows}
-'''
-    elif fmt == "xls":
-        render = '''
-
-def handler(event, _context=None):
-    from openpyxl import Workbook
-
-    d = _detail(event)
-    report_id = d["reportId"]
-    report_type = d.get("reportType", "report")
-    table = _read_table(d["processedParquetUri"])
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = report_type[:31]
-    ws.append(table.column_names)
-    for row in zip(*[col.to_pylist() for col in table.columns]):
-        ws.append(list(row))
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    key = _output_key(report_type, report_id)
-    s3.put_object(Bucket=REPORT_BUCKET, Key=key, Body=buf.getvalue())
-    return {"output": f"s3://{REPORT_BUCKET}/{key}", "rows": table.num_rows}
-'''
-    else:  # pdf
-        render = '''
-
-def handler(event, _context=None):
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
-    from reportlab.lib import colors
-
-    d = _detail(event)
-    report_id = d["reportId"]
-    report_type = d.get("reportType", "report")
-    table = _read_table(d["processedParquetUri"])
-
-    data = [table.column_names]
-    for row in zip(*[col.to_pylist() for col in table.columns]):
-        data.append([str(c) for c in row])
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4)
-    t = Table(data)
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-    ]))
-    doc.build([t])
-
-    key = _output_key(report_type, report_id)
-    s3.put_object(Bucket=REPORT_BUCKET, Key=key, Body=buf.getvalue())
-    return {"output": f"s3://{REPORT_BUCKET}/{key}", "rows": table.num_rows}
-'''
-
-    ext = {"pdf": "pdf", "xls": "xlsx", "csv": "csv"}[fmt]
-    return _r(common_head + render, FMT=fmt, FMT_UP=fmt.upper(), EXT=ext, ORG=org)
-
-
-def format_lambda(root: Path, fmt: str, org: str) -> None:
-    base = f"terraform/backend/modules/reporting-lambdas/{fmt}"
-    write(root, f"{base}/handler.py", _format_handler_body(fmt, org))
-    reqs = "boto3\npyarrow\n"
-    lib = RENDER_LIBS[fmt]
-    if lib:
-        reqs += f"{lib}\n"
-    write(root, f"{base}/requirements.txt", reqs)
-
-
-# --------------------------------------------------------------------------- #
-# Terraform
-# --------------------------------------------------------------------------- #
-def terraform(root: Path, org: str, topic: str, runtime: str, formats: list[str]) -> None:
+def terraform(root: Path, org: str, topic: str, runtime: str) -> None:
     base = "terraform/backend/modules/reporting-lambdas"
 
     write(root, f"{base}/variables.tf", _r('''variable "org" {
@@ -244,16 +225,24 @@ def terraform(root: Path, org: str, topic: str, runtime: str, formats: list[str]
   default = "__ORG__"
 }
 
-variable "aws_region" {
+# Endpoint almacenamiento S3-compatible.
+# Dev:  http://minio.infra.svc.cluster.local:9000  (MinIO en K3s)
+# Prod: OCI Object Storage endpoint o vacío para AWS S3 real.
+variable "storage_endpoint" {
   type    = string
-  default = "us-east-1"
+  default = "http://minio.infra.svc.cluster.local:9000"
 }
 
-# floci en dev (http://VPS_IP:4566); vacío en staging/prod => AWS real.
-# En dev, sobreescribir con: TF_VAR_aws_endpoint_url=http://<VPS_IP>:4566 terraform apply
-variable "aws_endpoint_url" {
-  type    = string
-  default = "http://localhost:4566"
+variable "storage_access_key" {
+  type      = string
+  sensitive = true
+  default   = "minioadmin"
+}
+
+variable "storage_secret_key" {
+  type      = string
+  sensitive = true
+  default   = "changeme_minio"
 }
 
 variable "report_bucket" {
@@ -268,7 +257,7 @@ variable "lambda_runtime" {
 
 variable "kafka_bootstrap_servers" {
   type    = string
-  default = "kafka:9092"
+  default = "kafka-kafka-bootstrap.messaging.svc.cluster.local:9092"
 }
 
 variable "kafka_topic" {
@@ -293,7 +282,7 @@ resource "aws_iam_role" "reporting_lambda" {
 }
 
 data "aws_iam_policy_document" "reporting_lambda" {
-  # Lee processed/, escribe output/ (DR-6) y publica a EventBridge (consumer).
+  # Lee processed/, escribe output/ — sin EventBridge (SIN EventBridge intermedio).
   statement {
     actions   = ["s3:GetObject", "s3:ListBucket"]
     resources = ["arn:aws:s3:::${var.report_bucket}", "arn:aws:s3:::${var.report_bucket}/processed/*"]
@@ -303,8 +292,8 @@ data "aws_iam_policy_document" "reporting_lambda" {
     resources = ["arn:aws:s3:::${var.report_bucket}/output/*"]
   }
   statement {
-    actions   = ["events:PutEvents"]
-    resources = ["*"]
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:*:*:*"]
   }
 }
 
@@ -315,12 +304,8 @@ resource "aws_iam_role_policy" "reporting_lambda" {
 }
 ''')
 
-    # Bus + consumer lambda + Kafka trigger
-    write(root, f"{base}/eventbridge.tf", '''resource "aws_cloudwatch_event_bus" "report_bus" {
-  name = "${var.org}-report-bus"
-}
-
-# --- Lambda Kafka Consumer: report.processed -> EventBridge PutEvents (DR-5) ---
+    write(root, f"{base}/lambda.tf", _r('''# Kafka Consumer Lambda — genera CSV/XLS directamente desde parquet.
+# SIN EventBridge intermedio (alineado con DS-xxx capa serverless de formatos).
 data "archive_file" "kafka_consumer" {
   type        = "zip"
   source_dir  = "${path.module}/kafka-consumer"
@@ -328,24 +313,28 @@ data "archive_file" "kafka_consumer" {
 }
 
 resource "aws_lambda_function" "kafka_consumer" {
-  function_name    = "${var.org}-report-kafka-consumer"
+  function_name    = "${var.org}-report-format-consumer"
   role             = aws_iam_role.reporting_lambda.arn
   runtime          = var.lambda_runtime
   handler          = "handler.handler"
   filename         = data.archive_file.kafka_consumer.output_path
   source_code_hash = data.archive_file.kafka_consumer.output_base64sha256
-  timeout          = 60
+  timeout          = 300
+  memory_size      = 1024
 
   environment {
     variables = {
-      EVENTBRIDGE_BUS  = aws_cloudwatch_event_bus.report_bus.name
-      AWS_ENDPOINT_URL = var.aws_endpoint_url
-      REPORT_BUCKET    = var.report_bucket
+      REPORT_BUCKET              = var.report_bucket
+      STORAGE_ENDPOINT           = var.storage_endpoint
+      STORAGE_ACCESS_KEY         = var.storage_access_key
+      STORAGE_SECRET_KEY         = var.storage_secret_key
+      KAFKA_BOOTSTRAP_SERVERS    = var.kafka_bootstrap_servers
     }
   }
 }
 
-# Trigger Kafka self-managed (floci/MSK) sobre el topic report.processed (DR-9).
+# Trigger Kafka self-managed (Strimzi en K3s / MSK en prod).
+# topic: __TOPIC__ = ReportParquetGenerated (output de report-etl-service).
 resource "aws_lambda_event_source_mapping" "kafka_consumer" {
   function_name     = aws_lambda_function.kafka_consumer.arn
   topics            = [var.kafka_topic]
@@ -357,143 +346,119 @@ resource "aws_lambda_event_source_mapping" "kafka_consumer" {
     }
   }
 }
-''')
+''', TOPIC=topic))
 
-    # Per-format lambdas + rules
-    rules_tf = ""
-    for fmt in formats:
-        fmt_up = fmt.upper()
-        rules_tf += _r('''
-# ===================== Formato __FMT_UP__ =====================
-data "archive_file" "__FMT__" {
-  type        = "zip"
-  source_dir  = "${path.module}/__FMT__"
-  output_path = "${path.module}/build/__FMT__.zip"
+    write(root, f"{base}/outputs.tf", '''output "format_consumer_function" {
+  value       = aws_lambda_function.kafka_consumer.function_name
+  description = "Lambda Kafka Consumer que genera CSV/XLS desde parquet (sin EventBridge)."
 }
 
-resource "aws_lambda_function" "__FMT__" {
-  function_name    = "${var.org}-report-__FMT__"
-  role             = aws_iam_role.reporting_lambda.arn
-  runtime          = var.lambda_runtime
-  handler          = "handler.handler"
-  filename         = data.archive_file.__FMT__.output_path
-  source_code_hash = data.archive_file.__FMT__.output_base64sha256
-  timeout          = 120
-  memory_size      = 512
-
-  environment {
-    variables = {
-      REPORT_BUCKET    = var.report_bucket
-      AWS_ENDPOINT_URL = var.aws_endpoint_url
-    }
-  }
-}
-
-resource "aws_cloudwatch_event_rule" "__FMT__" {
-  name           = "${var.org}-report-__FMT__"
-  event_bus_name = aws_cloudwatch_event_bus.report_bus.name
-  event_pattern = jsonencode({
-    "source"      = ["${var.org}.reporting"]
-    "detail-type" = ["ReportFormatRequested"]
-    "detail"      = { "format" = ["__FMT_UP__"] }
-  })
-}
-
-resource "aws_cloudwatch_event_target" "__FMT__" {
-  rule           = aws_cloudwatch_event_rule.__FMT__.name
-  event_bus_name = aws_cloudwatch_event_bus.report_bus.name
-  arn            = aws_lambda_function.__FMT__.arn
-}
-
-resource "aws_lambda_permission" "__FMT__" {
-  statement_id  = "AllowEventBridge__FMT_UP__"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.__FMT__.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.__FMT__.arn
-}
-''', FMT=fmt, FMT_UP=fmt_up)
-
-    write(root, f"{base}/formats.tf", rules_tf.lstrip("\n"))
-
-    write(root, f"{base}/outputs.tf", '''output "report_bus_name" {
-  value = aws_cloudwatch_event_bus.report_bus.name
-}
-
-output "kafka_consumer_function" {
-  value = aws_lambda_function.kafka_consumer.function_name
+output "format_consumer_arn" {
+  value = aws_lambda_function.kafka_consumer.arn
 }
 ''')
-
 
 
 # --------------------------------------------------------------------------- #
 # scaffold
 # --------------------------------------------------------------------------- #
-def scaffold(org: str, formats: list[str], topic: str, runtime: str,
-             root_arg: str | None) -> None:
+def scaffold(org: str, topic: str, runtime: str, root_arg: str | None) -> None:
     root = Path(root_arg) if root_arg else Path(".")
-    logger.info("Scaffolding reporting serverless layer at: %s", root.resolve())
-    logger.info("org=%s formats=%s topic=%s runtime=%s", org, formats, topic, runtime)
+    logger.info("Scaffolding reporting format consumer at: %s", root.resolve())
+    logger.info("org=%s topic=%s runtime=%s", org, topic, runtime)
 
-    kafka_consumer_handler(root, org, topic, formats)
-    for fmt in formats:
-        format_lambda(root, fmt, org)
-    terraform(root, org, topic, runtime, formats)
+    # El handler soporta CSV y XLS inline; el formato viene del campo `format` del evento.
+    kafka_consumer_handler(root, org, topic)
+    terraform(root, org, topic, runtime)
 
-    write(root, "terraform/backend/modules/reporting-lambdas/README.md", _r('''# reporting-lambdas — capa serverless de formatos
+    write(root, "terraform/backend/modules/reporting-lambdas/README.md", _r('''# reporting-lambdas — capa de formatos del subsistema de reportería
 
-Generado por `report_lambdas_scaffold.py` (PLAN-reporteria-spark-etl.md §7.2).
+Generado por `report_lambdas_scaffold.py` (DS-xxx capa serverless de formatos).
+
+## Arquitectura
+
+```
+Kafka topic: __TOPIC__  (= ReportParquetGenerated, output de report-etl-service)
+       │
+       ▼
+Lambda Kafka Consumer  ──►  lee parquet (MinIO dev / OCI Object Storage prod)
+       │                ──►  genera CSV → output/csv/<reportType>/<reportId>.csv
+       │                ──►  genera XLS → output/xls/<reportType>/<reportId>.xlsx
+       │
+       └── error ──►  Kafka topic: report.processing.failed  (ReportETLFailed)
+```
+
+**SIN EventBridge intermedio** — un solo consumer genera todos los formatos.
+
+## Almacenamiento
+
+| Entorno | Endpoint | Tipo |
+|---------|----------|------|
+| Dev (K3s) | `http://minio.infra.svc.cluster.local:9000` | MinIO (S3-compatible) |
+| Prod (OCI) | OCI Object Storage S3-compatible endpoint | OCI Object Storage |
+
+## Estructura generada
 
 ```
 terraform/backend/modules/reporting-lambdas/
 ├── variables.tf
 ├── iam.tf
-├── eventbridge.tf
-├── formats.tf
+├── lambda.tf          # Lambda + Kafka trigger (sin EventBridge)
 ├── outputs.tf
-├── kafka-consumer/   # consume __TOPIC__ -> PutEvents EventBridge (DR-5)
-__FORMAT_DIRS__
+└── kafka-consumer/    # consume __TOPIC__ → genera CSV/XLS directamente
+    ├── handler.py
+    └── requirements.txt
 ```
 
-## Desplegar (dev, floci)
-
-Descomentar el bloque `module "reporting_lambdas"` en
-`terraform/backend/environments/dev/main.tf`, luego:
+## Desplegar (dev, K3s)
 
 ```bash
 cd terraform/backend/environments/dev
 terraform init
-terraform apply
+terraform apply \
+  -var="storage_endpoint=http://VPS_IP:9000" \
+  -var="kafka_bootstrap_servers=VPS_IP:32092"
 ```
 
-El **mismo** módulo aplica en staging/prod (AWS real): solo cambian las variables
-`aws_endpoint_url` (vacío => AWS real) pasadas desde cada environment (DR-8).
-''', TOPIC=topic,
-        FORMAT_DIRS="".join(f"├── {f}/{' ' * (16 - len(f))}# parquet -> {f.upper()} -> output/{f}/\n"
-                            for f in formats)))
+## Variables de entorno de la Lambda
+
+| Variable | Descripción |
+|----------|-------------|
+| `STORAGE_ENDPOINT` | Endpoint S3-compatible (MinIO o OCI) |
+| `STORAGE_ACCESS_KEY` | Access key del almacenamiento |
+| `STORAGE_SECRET_KEY` | Secret key del almacenamiento |
+| `REPORT_BUCKET` | Nombre del bucket/contenedor |
+| `KAFKA_BOOTSTRAP_SERVERS` | Bootstrap de Kafka para publicar ReportETLFailed |
+''', TOPIC=topic))
 
     abs_root = root.resolve()
     tf_module = abs_root / "terraform/backend/modules/reporting-lambdas"
-    print(f"\nDone! Reporting serverless layer scaffolded at: {tf_module}")
+    print(f"\nDone! Reporting format consumer scaffolded at: {tf_module}")
+    print("\nArquitectura:")
+    print(f"  report-etl-service (Scala) → publica 1 evento por formato en: {topic}")
+    print("    Evento: {reportId, reportType, processedParquetUri, format: 'CSV'|'XLS'}")
+    print("  Lambda Consumer → lee format del evento → genera ese archivo inline")
     print("\nNext:")
-    print("  1. Descomenta el bloque module \"reporting_lambdas\" en terraform/backend/environments/dev/main.tf")
-    print("  2. cd terraform/backend/environments/dev && terraform init && terraform validate")
-    print("  3. terraform apply   # dev sobre floci (:4566)")
+    print("  1. Descomenta el módulo 'reporting_lambdas' en terraform/.../main.tf")
+    print("  2. terraform init && terraform apply")
+    print(f"  3. El consumer escuchará: {topic}")
+    print("     Formato CSV  → output/csv/<reportType>/<reportId>.csv")
+    print("     Formato XLS  → output/xls/<reportType>/<reportId>.xlsx")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="report_lambdas_scaffold",
-        description="Genera la capa serverless de formatos (lambdas + Terraform EventBridge).",
+        description="Genera el Kafka Consumer de formatos (CSV/XLS) — sin EventBridge.",
     )
-    parser.add_argument("--org", required=True, help="Prefijo del proyecto (buckets/bus).")
-    parser.add_argument("--formats", default="pdf,xls,csv",
-                        help="Lista CSV de formatos (pdf,xls,csv). Default: pdf,xls,csv")
+    parser.add_argument("--org", required=True,
+                        help="Prefijo del proyecto (bucket, nombres de recursos).")
     parser.add_argument("--kafka-topic", default="report.processed",
-                        help="Topic que consume el Lambda Kafka Consumer (default: report.processed).")
-    parser.add_argument("--runtime", default="python3.12", help="Runtime de las lambdas.")
-    parser.add_argument("root", nargs="?", default=None, help="Directorio raíz (default: .)")
+                        help="Topic Kafka a consumir (= ReportParquetGenerated). Default: report.processed")
+    parser.add_argument("--runtime", default="python3.12",
+                        help="Runtime Lambda. Default: python3.12")
+    parser.add_argument("root", nargs="?", default=None,
+                        help="Directorio raíz (default: .)")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -505,16 +470,10 @@ def main() -> None:
         stream=sys.stdout,
     )
 
-    formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
-    invalid = set(formats) - VALID_FORMATS
-    if invalid:
-        logger.error("Formatos no soportados: %s (válidos: pdf, xls, csv)", invalid)
-        sys.exit(1)
-
     try:
-        scaffold(args.org, formats, args.kafka_topic, args.runtime, args.root)
+        scaffold(args.org, args.kafka_topic, args.runtime, args.root)
     except OSError as e:
-        logger.error("No se pudo generar la capa serverless: %s", e)
+        logger.error("No se pudo generar la capa de formatos: %s", e)
         sys.exit(1)
 
 

@@ -194,6 +194,7 @@ check_endpoints() {
     ["Vault"]="http://${VM_IP}:8200/v1/sys/health"
     ["Grafana"]="http://${VM_IP}:3001/api/health"
     ["Prometheus"]="http://${VM_IP}:9090/-/healthy"
+    ["MinIO"]="http://${VM_IP}:9000/minio/health/live"
   )
 
   for name in "${!endpoints[@]}"; do
@@ -240,6 +241,8 @@ print_endpoints() {
   printf "  %-20s %-45s\n" "Prometheus"  "http://$VM_IP:9090"
   printf "  %-20s %-45s\n" "LRA Coord."  "http://$VM_IP:50000"
   printf "  %-20s %-45s\n" "WireMock"    "http://$VM_IP:9999"
+  printf "  %-20s %-45s\n" "MinIO API"   "http://$VM_IP:9000   (minioadmin / S3-compatible)"
+  printf "  %-20s %-45s\n" "MinIO UI"    "http://$VM_IP:9001   (consola web)"
   log ""
   log "  Kafka bootstrap: kafka-kafka-bootstrap.messaging.svc.cluster.local:9092"
   log "  OTEL gRPC:       tempo.observability.svc.cluster.local:4317"
