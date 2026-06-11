@@ -17,11 +17,14 @@ def get_yaml_content(project_name: str, database: str, messaging_system: str, po
         "  application:",
         f"    name: {project_name}",
         "  config:",
-        f'    import: "aws-secretsmanager:/{org}/${{APP_ENV:dev}}/{project_name}"',
+        f'    import: "optional:vault://{org}/${{APP_ENV:dev}}/{project_name}"',
         "  cloud:",
-        "    aws:",
-        "      region:",
-        "        static: us-east-1",
+        "    vault:",
+        "      uri: ${VAULT_ADDR:http://vault.secrets.svc.cluster.local:8200}",
+        "      token: ${VAULT_TOKEN}",
+        "      kv:",
+        "        enabled: true",
+        "        backend: secret",
     ]
     if database.lower() == "mongo":
         lines += ["  data:", "    mongodb:", "      uri: ${MONGODB_URI}"]
@@ -79,70 +82,75 @@ def get_dev_yaml_content() -> str:
     return """\
 spring:
   cloud:
-    aws:
-      secretsmanager:
-        endpoint: ${SM_ENDPOINT:http://localhost:4566}
-      credentials:
-        access-key: test
-        secret-key: test
+    vault:
+      # En dev apunta al Vault de K3s; exportar VAULT_TOKEN desde vault-init.json
+      uri: ${VAULT_ADDR:http://vault.secrets.svc.cluster.local:8200}
+      token: ${VAULT_TOKEN:dev-root-token}
 """
 
 
 def get_secrets_setup_content(project_name: str, database: str, messaging_system: str,
                               port: int = 8080, org: str = "myproject",
                               pg_db_prefix: str = "", mongo_db_prefix: str = "") -> str:
-    # Database-per-Service: nombre de BD = <prefix>_<servicio_slug> si hay prefijo,
-    # o <servicio_slug> si no. Convención alineada con init-databases.sh y
-    # create-all-secrets-dev.sh.
+    # Database-per-Service: nombre de BD = <prefix>_<servicio_slug>
+    # Convención alineada con init-databases.sh y create-all-secrets-vault.sh
     svc_slug = project_name.replace("-", "_")
-    pg_db   = f"{pg_db_prefix}_{svc_slug}" if pg_db_prefix else svc_slug
+    pg_db    = f"{pg_db_prefix}_{svc_slug}" if pg_db_prefix else svc_slug
     mongo_db = f"{mongo_db_prefix}_{svc_slug}" if mongo_db_prefix else svc_slug
 
-    secret: dict = {"SERVER_PORT": str(port)}
-    if database.lower() == "mongo":
-        secret["MONGODB_URI"] = f"mongodb://${{VPS_IP:-localhost}}:27017/{mongo_db}"
-    else:
-        secret["R2DBC_URL"] = f"r2dbc:postgresql://${{VPS_IP:-localhost}}:5432/{pg_db}"
-        secret["DB_USERNAME"] = org or "appuser"
-        secret["DB_PASSWORD"] = "change_me"
+    kvpairs: list[str] = [f"SERVER_PORT={port}"]
 
-    if messaging_system.lower() in ("rabbit-producer", "rabbit-consumer"):
-        secret["RABBITMQ_HOST"] = "${VPS_IP:-localhost}"
-        secret["RABBITMQ_PORT"] = "5672"
-        secret["RABBITMQ_USERNAME"] = "guest"
-        secret["RABBITMQ_PASSWORD"] = "guest"
+    if database.lower() == "mongo":
+        kvpairs += [
+            f"MONGO_URI=mongodb://{svc_slug}_user:changeme_{svc_slug}@mongodb.data.svc.cluster.local:27017/{mongo_db}?authSource={mongo_db}",
+            f"MONGO_DB={mongo_db}",
+        ]
+    else:
+        kvpairs += [
+            f"DB_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{pg_db}",
+            f"DB_REACTIVE_URL=r2dbc:postgresql://postgresql.data.svc.cluster.local:5432/{pg_db}",
+            f"DB_USERNAME={pg_db}_user",
+            f"DB_PASSWORD=changeme_{svc_slug}",
+        ]
 
     if "kafka-producer" in messaging_system.lower() or "kafka-consumer" in messaging_system.lower():
-        secret["KAFKA_BOOTSTRAP_SERVERS"] = "${VPS_IP:-localhost}:29092"
+        kvpairs += [
+            "KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.messaging.svc.cluster.local:9092",
+            f"KAFKA_GROUP_ID={org}-{svc_slug}",
+        ]
 
-    if "kafka-consumer" in messaging_system.lower():
-        secret["KAFKA_CONSUMER_GROUP_ID"] = f"{project_name}-group"
+    # Keycloak (todos los servicios validan tokens)
+    kvpairs += [
+        f"KEYCLOAK_URL=http://keycloak.identity.svc.cluster.local:8080",
+        f"KEYCLOAK_REALM={org}",
+        f"KEYCLOAK_CLIENT_ID={project_name}",
+        f"KEYCLOAK_CLIENT_SECRET=changeme_{svc_slug}_client",
+    ]
 
-    secret_json = json.dumps(secret)
+    kvpairs_str = " ".join(f'"{kv}"' for kv in kvpairs)
+
     return f"""\
 #!/usr/bin/env bash
-# Crea (o actualiza) el secret de desarrollo en floci (VPS).
-# Requiere que floci esté corriendo en $VPS_IP:4566 (o localhost:4566 por defecto).
-# Uso: VPS_IP=192.168.122.50 bash create-secrets-dev.sh
+# Crea/actualiza el secret de este servicio en HashiCorp Vault (K3s).
+# Uso: KUBECONFIG=~/.kube/config-{org}-local bash create-secrets-dev.sh
+# Requiere que Vault esté unsealed y que vault-init.json esté disponible.
 
-SECRET_NAME="{org}/dev/{project_name}"
-ENDPOINT="${{FLOCI_ENDPOINT:-http://localhost:4566}}"
-REGION="us-east-1"
+set -euo pipefail
+KUBECONFIG="${{KUBECONFIG:-$HOME/.kube/config-{org}-local}}"
+SECRET_PATH="{org}/dev/{project_name}"
+INIT_FILE="${{VAULT_INIT_FILE:-./vault-init.json}}"
 
-if aws --endpoint-url="$ENDPOINT" secretsmanager describe-secret \\
-       --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
-    aws --endpoint-url="$ENDPOINT" secretsmanager put-secret-value \\
-        --secret-id "$SECRET_NAME" \\
-        --secret-string '{secret_json}' \\
-        --region "$REGION"
-    echo "Secret actualizado: $SECRET_NAME"
-else
-    aws --endpoint-url="$ENDPOINT" secretsmanager create-secret \\
-        --name "$SECRET_NAME" \\
-        --secret-string '{secret_json}' \\
-        --region "$REGION"
-    echo "Secret creado: $SECRET_NAME"
+if [[ -f "$INIT_FILE" ]]; then
+    VAULT_TOKEN=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['root_token'])" 2>/dev/null \\
+        || jq -r '.root_token' "$INIT_FILE" 2>/dev/null)
 fi
+VAULT_TOKEN="${{VAULT_TOKEN:-${{VAULT_ROOT_TOKEN:-}}}}"
+[[ -z "$VAULT_TOKEN" ]] && {{ echo "ERROR: VAULT_TOKEN no disponible"; exit 1; }}
+
+kubectl --kubeconfig="$KUBECONFIG" exec -n secrets vault-0 -- \\
+    sh -c "VAULT_TOKEN=${{VAULT_TOKEN}} vault kv put secret/${{SECRET_PATH}} {kvpairs_str}"
+
+echo "Secret creado/actualizado: secret/${{SECRET_PATH}}"
 """
 
 
@@ -229,12 +237,13 @@ def get_jenkinsfile_content(project_name: str, database: str, org: str = "myproj
 //
 // Modelo de agentes: Kubernetes plugin. Todo el pipeline corre en un único pod
 // efímero (definido en org/__LIB_ORG__/podBackend.yaml de la Shared Library) en
-// el cluster del ambiente: K3s nativo en VPS en dev, EKS en staging/prod. El workspace
+// el cluster K3s del VPS (local QEMU en dev, Oracle Cloud OCI en prod). El workspace
 // se comparte entre stages sin stash/unstash. El pod usa el ServiceAccount
-// 'jenkins-agent': IRSA para kaniko en staging/prod; en dev kaniko empuja al
-// Gitea Package Registry (HTTP). El despliegue NO ocurre aquí: este pipeline es CI y su
-// frontera con el CD es escribir el nuevo image tag en Git (bumpImageTag). El CD lo hace
-// ArgoCD por GitOps (auto-sync en dev/staging; sync manual en prod).
+// 'jenkins-agent'. Kaniko empuja al Gitea Package Registry (HTTP) en ambos entornos.
+// Secrets leídos desde HashiCorp Vault vía spring-cloud-vault-config.
+// El despliegue NO ocurre aquí: este pipeline es CI y su frontera con el CD es
+// escribir el nuevo image tag en Git (bumpImageTag). El CD lo hace ArgoCD por GitOps
+// (auto-sync via ApplicationSet Git generator sobre helm-charts repo).
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
@@ -473,7 +482,7 @@ image:
   repository: ""
   tag: ""
 """
-    values_dev = image_block + f"""\
+    values_dev = image_block + """\
 replicaCount: 1
 resources:
   requests:
@@ -483,12 +492,13 @@ resources:
     cpu: 500m
     memory: 512Mi
 otel:
-  collectorEndpoint: "http://{project_name}-otel-collector.monitoring:4317"
+  # Tempo recibe OTLP directamente (no hay OTEL Collector separado)
+  collectorEndpoint: "http://tempo.observability.svc.cluster.local:4317"
 """
     values_staging = image_block + """\
 replicaCount: 2
 otel:
-  collectorEndpoint: "http://otel-collector.monitoring:4317"
+  collectorEndpoint: "http://tempo.observability.svc.cluster.local:4317"
 """
     values_prod = image_block + """\
 replicaCount: 3
@@ -500,7 +510,7 @@ resources:
     cpu: "2"
     memory: 2Gi
 otel:
-  collectorEndpoint: "http://otel-collector.monitoring:4317"
+  collectorEndpoint: "http://tempo.observability.svc.cluster.local:4317"
 """
 
     deployment_tpl = """\
@@ -657,9 +667,9 @@ def get_root_pom(project_name: str, database: str, messaging_system: str, outbox
     <dependencyManagement>
         <dependencies>
             <dependency>
-                <groupId>io.awspring.cloud</groupId>
-                <artifactId>spring-cloud-aws-dependencies</artifactId>
-                <version>3.2.1</version>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>2024.0.1</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -667,8 +677,8 @@ def get_root_pom(project_name: str, database: str, messaging_system: str, outbox
     </dependencyManagement>
     <dependencies>
         <dependency>
-            <groupId>io.awspring.cloud</groupId>
-            <artifactId>spring-cloud-aws-starter-secrets-manager</artifactId>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-vault-config</artifactId>
         </dependency>
         <dependency>
             <groupId>io.projectreactor</groupId>
@@ -1805,68 +1815,89 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
 
 
 def _update_argocd_applicationset(service_name: str, org: str = "myproject") -> None:
+    """Crea la estructura del Helm chart en el repo <org>-helm-charts en Gitea.
+
+    El ApplicationSet de ArgoCD usa un Git generator que auto-descubre servicios desde
+    charts/ en el repo helm-charts. No se necesita actualizar YAML estáticos.
+    Esta función crea el directorio charts/<service>/ con Chart.yaml y values-*.yaml.
+    """
     import os as _os
+    import base64
+    import json as _json
+    import urllib.request
+    import urllib.error
+
     _vps_ip = _os.environ.get("VPS_IP", "localhost")
     gitea_host = f"http://{_vps_ip}:3000"
-    repo_root = Path(__file__).parent.parent.parent
-    envs = ["dev", "staging", "prod"]
-    sentinel = "          # -- services managed by scaffold --\n"
-    entry = (
-        f"          - service: {service_name}\n"
-        f"            repoURL: {gitea_host}/{org}/{service_name}.git\n"
-        f"            revision: main\n"
-    )
+    credentials = base64.b64encode(b"gitea_admin:changeme_gitea_admin").decode()
+    helm_charts_repo = f"{org}-helm-charts"
 
-    for env in envs:
-        appset = (
-            repo_root
-            / "terraform" / "backend" / "environments" / env
-            / "argocd-bootstrap" / "applicationset.yaml"
+    def gitea_put_file(repo: str, file_path: str, content: str, message: str) -> None:
+        import base64 as _b64
+        encoded = _b64.b64encode(content.encode()).decode()
+        # Obtener SHA si el archivo ya existe
+        sha = ""
+        try:
+            req = urllib.request.Request(
+                f"{gitea_host}/api/v1/repos/{org}/{repo}/contents/{file_path}",
+                headers={"Authorization": f"Basic {credentials}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                sha = _json.loads(r.read())["sha"]
+        except urllib.error.HTTPError:
+            pass
+
+        payload_dict = {"message": message, "content": encoded}
+        if sha:
+            payload_dict["sha"] = sha
+
+        req = urllib.request.Request(
+            f"{gitea_host}/api/v1/repos/{org}/{repo}/contents/{file_path}",
+            data=_json.dumps(payload_dict).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}"},
+            method="PUT",
         )
-        if not appset.exists():
-            logger.debug("[ArgoCD] %s no encontrado, omitiendo", appset)
-            continue
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            logger.info("[Gitea helm-charts] %s/%s creado/actualizado", repo, file_path)
+        except urllib.error.HTTPError as e:
+            logger.warning("[Gitea helm-charts] No se pudo escribir %s: HTTP %s", file_path, e.code)
 
-        content = appset.read_text()
-        if f"service: {service_name}" in content:
-            logger.debug("[ArgoCD] '%s' ya existe en applicationset.yaml (%s)", service_name, env)
-            continue
+    try:
+        urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
+    except Exception:
+        logger.warning(
+            "[Gitea] No activo en %s — crear el Helm chart manualmente en %s/charts/%s/",
+            gitea_host, helm_charts_repo, service_name
+        )
+        return
 
-        if sentinel not in content:
-            logger.warning("[ArgoCD] Sentinel no encontrado en %s", appset)
-            continue
+    for env in ["dev", "local", "prod"]:
+        gitea_put_file(
+            helm_charts_repo,
+            f"charts/{service_name}/values-{env}.yaml",
+            f"# values-{env}.yaml para {service_name}\nimage:\n  repository: \"\"\n  tag: \"\"\n",
+            f"ci: scaffold {service_name} helm chart ({env})",
+        )
 
-        appset.write_text(content.replace(sentinel, sentinel + entry))
-        logger.info("[ArgoCD] '%s' añadido a applicationset.yaml (%s)", service_name, env)
+    logger.info(
+        "[ArgoCD] Helm chart para '%s' agregado a %s/charts/%s — "
+        "ArgoCD ApplicationSet lo descubrirá automáticamente.",
+        service_name, helm_charts_repo, service_name
+    )
 
 
 def _update_terraform_services(service_name: str) -> None:
-    repo_root = Path(__file__).parent.parent.parent
-    envs = ["dev", "staging", "prod"]
-    pattern = re.compile(r'(services\s*=\s*\[)([^\]]*?)(\])')
-
-    for env in envs:
-        main_tf = repo_root / "terraform" / "backend" / "environments" / env / "main.tf"
-        if not main_tf.exists():
-            logger.debug("[Terraform] %s no encontrado, omitiendo", main_tf)
-            continue
-
-        content = main_tf.read_text()
-        match = pattern.search(content)
-        if not match:
-            logger.warning("[Terraform] No se encontró 'services' en %s", main_tf)
-            continue
-
-        existing = [s.strip().strip('"') for s in match.group(2).split(',') if s.strip().strip('"')]
-        if service_name in existing:
-            logger.info("[Terraform] '%s' ya existe en services (%s)", service_name, env)
-            continue
-
-        existing.append(service_name)
-        new_list = ", ".join(f'"{s}"' for s in existing)
-        new_content = content[:match.start()] + f'{match.group(1)}{new_list}{match.group(3)}' + content[match.end():]
-        main_tf.write_text(new_content)
-        logger.info("[Terraform] Agregado '%s' a services en %s", service_name, env)
+    """No-op: la infraestructura Terraform se genera en tiempo de ejecución por
+    base-infrastructure-builder.sh (no existen archivos Terraform estáticos en el repo).
+    La creación de BDs por servicio la realiza init-databases.sh.
+    Los secrets se crean con create-all-secrets-vault.sh.
+    """
+    logger.info(
+        "[Terraform] Omitido — la infra se genera en runtime. "
+        "Ejecutar: .claude/scripts/init-databases.sh --service %s para crear la BD.",
+        service_name
+    )
 
 
 def _print_run_instructions(project_name: str, root: Path, messaging_system: str, port: int = 8080, org: str = "myproject") -> None:
@@ -1886,45 +1917,35 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
  1. Entra al directorio del proyecto:
     cd {root}
 
- 2. Asegúrate de que floci esté corriendo y crea el secret de desarrollo:
+ 2. Exporta el token de Vault y crea el secret del servicio:
+    export VAULT_TOKEN=$(jq -r '.root_token' ./vault-init.json)
     bash scripts/create-secrets-dev.sh
 {rabbit_note}
  3. Compila el proyecto:
     mvn clean install -DskipTests
 
- 4. Ejecuta la aplicación (perfil dev → apunta a floci):
+ 4. Ejecuta la aplicación (perfil dev → lee secrets de Vault en K3s):
     SPRING_PROFILES_ACTIVE=dev \\
+    VAULT_TOKEN=$VAULT_TOKEN \\
+    VAULT_ADDR=http://VPS_IP:8200 \\
     mvn -pl infrastructure/entry-points/app spring-boot:run
 
  5. Verifica que está corriendo:
     curl http://localhost:{port}/hello
 
- ── Ejecución con Docker ───────────────────────────────────────────────
+ ── Despliegue en K3s (CI/CD) ──────────────────────────────────────────
 
-    # Construir la imagen
-    docker build -t {project_name}:latest .
+    # Jenkins construye la imagen y la publica en Gitea Package Registry
+    # ArgoCD detecta el cambio en helm-charts y sincroniza automáticamente
+    # Ver pipeline: http://VPS_IP:8080/job/{project_name}
 
-    # Ejecutar apuntando a floci del host (o a AWS real en staging/prod)
-    docker run -d --name {project_name} \\
-      -e SPRING_PROFILES_ACTIVE=dev \\
-      -e APP_ENV=dev \\
-      --network host \\
-      -p {port}:{port} \\
-      {project_name}:latest
+ ── HashiCorp Vault ────────────────────────────────────────────────────
 
- Verificar contenedor:
-    docker logs -f {project_name}
-    curl http://localhost:{port}/hello
-
- Detener y eliminar:
-    docker rm -f {project_name}
-
- ── AWS Secrets Manager ────────────────────────────────────────────────
-
- Secret path:  {org}/<APP_ENV>/{project_name}
- Perfil dev:   application-dev.yml apunta a floci (http://localhost:4566)
- Staging/prod: usa IRSA (ServiceAccount 'jenkins-agent' en EKS), sin credenciales
-               hardcodeadas. Cambiar APP_ENV=staging|prod al desplegar.
+ Secret path:  secret/{org}/<APP_ENV>/{project_name}
+ Vault UI:     http://VPS_IP:8200
+ Dev:          application-dev.yml apunta a Vault en K3s
+               VAULT_TOKEN desde vault-init.json
+ Prod:         VAULT_TOKEN desde OCI Vault secret o variable de entorno
 
 ────────────────────────────────────────────────────────────────────────
 """
