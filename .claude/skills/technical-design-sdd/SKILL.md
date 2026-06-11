@@ -219,10 +219,12 @@ Documentar tecnologías seleccionadas.
 - frontend,
 - base de datos,
 - mensajería,
-- cache,
 - autenticación,
-- infraestructura,
-- CI/CD.
+- secretos,
+- infraestructura / orquestación,
+- registry de imágenes,
+- CI/CD,
+- observabilidad.
 
 # FORMATO OBLIGATORIO
 
@@ -234,6 +236,7 @@ Documentar tecnologías seleccionadas.
 - Justificar decisiones importantes.
 - Priorizar tecnologías coherentes con drivers arquitectónicos.
 - Tomar como base las decisiones estratégicas del Strategic Design.
+- La categoría **Infraestructura / orquestación** debe reflejar el stack del framework: K3s (ambos entornos), Terraform + provider Helm (IaC), Traefik (ingress). La categoría **Autenticación** debe indicar Keycloak. La categoría **Secretos** debe indicar HashiCorp Vault. **No mencionar EKS, Cognito, AWS Secrets Manager ni RDS.**
 
 ---
 
@@ -551,24 +554,46 @@ Describir:
 - Mantener enfoque práctico.
 - No entrar en configuración excesiva.
 
-# INFRAESTRUCTURA BASE COMO CÓDIGO (TERRAFORM)
+# INFRAESTRUCTURA BASE COMO CÓDIGO (TERRAFORM + HELM)
 
-Esta sección debe indicar que la infraestructura base del proyecto se aprovisiona con el script de Terraform del repositorio:
+Esta sección debe indicar que la infraestructura base del proyecto se aprovisiona con el script:
 
 - `.claude/scripts/base-infrastructure-builder.sh`
 
-Este script genera el árbol Terraform multi-ambiente (`dev`/`staging`/`prod`) para:
+Al ejecutarse, este script realiza cuatro fases en secuencia:
 
-- **Frontend**: pod Kubernetes (Deployment + Service + Ingress Traefik) en K3s — imagen construida por Jenkins, publicada en **Gitea Package Registry** (`VPS_IP:3000/<org>`) en dev o **OCIR (Oracle Container Registry)** en prod, desplegada por ArgoCD.
-- **Infraestructura VPS (ambos entornos)**: K3s nativo en VPS Ubuntu. **Entorno dev**: VM QEMU/KVM local creada con `.claude/scripts/qemu-vps.sh` (configuración compatible OCI: SSH key-only, sudo NOPASSWD, UFW, UTC, NTP, cloud-init NoCloud); registry en **Gitea Package Registry**; **PostgreSQL 16 y MongoDB 7 corren como servicios systemd nativos** en la VM. **Entorno producción**: VPS en **Oracle Cloud Infrastructure (OCI)**; registry en **OCIR**; PostgreSQL 16 y MongoDB 7 como servicios systemd nativos en el VPS OCI; identidad vía **Keycloak** (desplegado en K3s via Helm); secretos vía **HashiCorp Vault** (desplegado en K3s via Helm).
+1. **Genera en tiempo de ejecución** la carpeta `terraform/` completa (providers, variables, main, outputs, módulos y environments) usando heredocs — **la carpeta no existe previamente en el repo**.
+2. **Instala K3s** en el VPS via SSH (VM QEMU/KVM local en dev, VPS Oracle Cloud OCI en prod).
+3. **Ejecuta `terraform init → plan → apply`** usando el **provider Helm** de Terraform para desplegar todos los servicios en el cluster K3s — no hay llamadas `helm` manuales ni SSH para servicios.
+4. **Post-apply**: crea bases de datos por servicio (`init-databases.sh`), configura org/repos en Gitea, publica la Jenkins Shared Library.
+
+La estructura de módulos Terraform generada es:
+
+| Módulo | Helm chart / recurso K8s | Namespace | Puerto NodePort |
+|---|---|---|---|
+| `modules/namespaces` | `kubernetes_namespace` para todos los namespaces | — | — |
+| `modules/helm-infra` | Traefik (ingress), cert-manager | `infra` | 80, 443 |
+| `modules/helm-data` | PostgreSQL 16, MongoDB 7 (Bitnami), Strimzi operator + Kafka CR (KRaft) | `data`, `messaging` | — |
+| `modules/helm-identity` | Keycloak (conectado a PostgreSQL) | `identity` | 8082 |
+| `modules/helm-secrets` | HashiCorp Vault (standalone + init automático) | `secrets` | 8200 |
+| `modules/helm-cicd` | Gitea (Package Registry OCI), Jenkins, ArgoCD + AppProject | `cicd` | 3000, 8080, 8081 |
+| `modules/helm-observability` | kube-prometheus-stack (Prometheus + Grafana + AlertManager), Loki, Promtail, Tempo | `observability` | 9090, 3001 |
+| `modules/helm-support` | Narayana LRA (`kubernetes_deployment`), WireMock (`kubernetes_deployment`) | `infra` | 50000, 9999 |
+
+Ambientes generados por el script en `terraform/environments/`:
+- `local.tfvars` — VM QEMU/KVM local (dev): contiene defaults para todas las contraseñas
+- `prod.tfvars` — VPS Oracle Cloud OCI (prod): contraseñas via `TF_VAR_xxx`, no en archivo
+- `auto.tfvars` — inyectado por el script en cada ejecución: `kubeconfig_path`, `vm_ip`, `project`, flags de módulos opcionales (`install_lra`, `install_wiremock`, etc.)
+
+Registry de imágenes: **Gitea Package Registry** (`http://VPS_IP:3000/<org>`) en dev / **OCIR (Oracle Container Registry)** en prod. Las imágenes son construidas por Jenkins y desplegadas por ArgoCD en K3s.
 
 # REGLAS PARA LA REFERENCIA AL SCRIPT
 
 - Referenciar el script por su ruta relativa: `.claude/scripts/base-infrastructure-builder.sh`.
-- Indicar que se ejecuta tras completar la etapa de Diseño Técnico, usando las decisiones de este documento (`infrastructure.md`) como insumos.
-- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los recursos que genera/verifica el script: K3s nativo en VPS (dev=VM QEMU/KVM local, prod=VPS Oracle Cloud OCI); PostgreSQL 16 y MongoDB 7 nativos en VPS en ambos entornos; Gitea Package Registry en dev / OCIR en prod; Keycloak para identidad (Helm/K3s, ambos entornos); HashiCorp Vault para secretos (Helm/K3s, ambos entornos). **No mencionar EKS, RDS ni ECR** — el modelo es VPS-nativo tanto en entorno local como en Oracle Cloud.
-- Si una decisión técnica del diseño difiere de lo que provisiona el script por defecto, indicarlo explícitamente como ajuste requerido.
-- Si el diseño incluye orquestación de saga con coordinador LRA, la tabla de componentes debe incluir el **coordinador Narayana LRA** (servicio systemd `lra-coordinator` en el VPS, puerto 50000) y, para las pruebas de integración de las rutas Camel, **WireMock** (servicio systemd `wiremock` en el VPS, puerto 9999). Ambos los aprovisiona `vps-setup.sh services`.
+- Indicar que se ejecuta tras completar la etapa de Diseño Técnico, usando las decisiones de `infrastructure.md` como insumos. La carpeta `terraform/` se genera en tiempo de ejecución — no editarla manualmente; los cambios deben hacerse en el script.
+- Documentar en la tabla de componentes la correspondencia entre las decisiones de infraestructura del diseño y los módulos Terraform que genera el script. **No mencionar EKS, RDS, ECR ni servicios systemd para bases de datos** — todo corre en K3s via Helm en ambos entornos (local y OCI).
+- Si una decisión técnica del diseño difiere del default del script (por ejemplo, deshabilitar Loki o WireMock), indicarlo explícitamente como flag al invocar el script (`--no-loki`, `--no-wiremock`, etc.) o como ajuste en `environments/<env>.tfvars`.
+- Si el diseño incluye orquestación de saga con coordinador LRA, la tabla de componentes debe incluir el **coordinador Narayana LRA** (pod K3s en namespace `infra`, NodePort 50000, provisionado por `modules/helm-support`) y, para pruebas de integración de rutas Camel, **WireMock** (pod K3s en namespace `infra`, NodePort 9999, provisionado por `modules/helm-support`).
 
 ---
 
@@ -672,10 +697,19 @@ Concluir:
 Indicar que la siguiente etapa del SDLC es:
 Desarrollo / Implementación.
 
-Incluir como paso operativo el aprovisionamiento de la infraestructura base mediante el script de Terraform del repositorio:
-- `.claude/scripts/base-infrastructure-builder.sh`
+Incluir como paso operativo el aprovisionamiento de la infraestructura base:
 
-ejecutado con las decisiones de infraestructura definidas en `infrastructure.md` como insumos.
+```bash
+.claude/scripts/base-infrastructure-builder.sh \
+  --vm-ip <VPS_IP> \
+  --project <nombre-proyecto> \
+  --pg-prefix <prefijo> \
+  --mongo-prefix <prefijo> \
+  --services "<svc1>,<svc2>,..." \
+  --env local   # o --env prod para Oracle Cloud OCI
+```
+
+El script genera la carpeta `terraform/` completa, instala K3s, despliega todos los servicios via Terraform + provider Helm, y ejecuta los pasos post-apply (bases de datos, Gitea, Jenkins Shared Library). Los módulos opcionales se controlan con `--no-lra`, `--no-wiremock`, `--no-loki`, `--no-tempo`.
 
 ---
 
