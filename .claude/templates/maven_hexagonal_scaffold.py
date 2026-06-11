@@ -588,6 +588,10 @@ metadata:
   name: {{ .Chart.Name }}
   labels:
     app: {{ .Chart.Name }}
+    monitoring: "true"
+  annotations:
+    # Kong Ingress Controller descubre este servicio via KongIngress / Ingress resource
+    konghq.com/plugins: jwt,rate-limiting
 spec:
   type: {{ .Values.service.type }}
   selector:
@@ -596,6 +600,55 @@ spec:
     - port: {{ .Values.service.port }}
       targetPort: {{ .Values.service.port }}
       protocol: TCP
+"""
+
+    # KongIngress — expone el servicio via Kong API Gateway
+    kong_ingress_tpl = """\
+apiVersion: configuration.konghq.com/v1
+kind: KongIngress
+metadata:
+  name: {{ .Chart.Name }}-kong-config
+upstream:
+  healthchecks:
+    active:
+      http_path: /actuator/health/readiness
+      healthy:
+        interval: 15
+        successes: 1
+      unhealthy:
+        interval: 5
+        http_failures: 2
+proxy:
+  connect_timeout: 5000
+  read_timeout: 60000
+  write_timeout: 60000
+  retries: 3
+route:
+  strip_path: false
+  preserve_host: true
+"""
+
+    # Ingress que registra el servicio en Kong (usa Kong Ingress Controller)
+    ingress_tpl = """\
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Chart.Name }}
+  annotations:
+    kubernetes.io/ingress.class: kong
+    konghq.com/strip-path: "true"
+    konghq.com/override: {{ .Chart.Name }}-kong-config
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/v1/{{ .Chart.Name }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Chart.Name }}
+                port:
+                  number: {{ .Values.service.port }}
 """
 
     helmignore = """\
@@ -613,6 +666,8 @@ spec:
         ".helmignore": helmignore,
         "templates/deployment.yaml": deployment_tpl,
         "templates/service.yaml": service_tpl,
+        "templates/kong-ingress.yaml": kong_ingress_tpl,
+        "templates/ingress.yaml": ingress_tpl,
     }
 
 
@@ -1933,10 +1988,25 @@ def _print_run_instructions(project_name: str, root: Path, messaging_system: str
  5. Verifica que está corriendo:
     curl http://localhost:{port}/hello
 
+ ── Kong API Gateway ────────────────────────────────────────────────────
+
+ El servicio se expone via Kong en:
+   http://VPS_IP:8000/api/v1/{project_name}/<endpoint>
+
+ Kong valida el JWT de Keycloak (plugin jwt + clave pública RS256).
+ El frontend y otros clientes llaman siempre al puerto 8000 de Kong.
+
+ Para registrar el servicio manualmente en Kong:
+   kubectl port-forward -n gateway svc/kong-kong-admin 18001:8001
+   curl -s -X POST http://localhost:18001/services \\
+     -d name={project_name} \\
+     -d url=http://{project_name}.apps.svc.cluster.local:{port}
+
  ── Despliegue en K3s (CI/CD) ──────────────────────────────────────────
 
     # Jenkins construye la imagen y la publica en Gitea Package Registry
     # ArgoCD detecta el cambio en helm-charts y sincroniza automáticamente
+    # Kong Ingress Controller registra la ruta en Kong automáticamente
     # Ver pipeline: http://VPS_IP:8080/job/{project_name}
 
  ── HashiCorp Vault ────────────────────────────────────────────────────

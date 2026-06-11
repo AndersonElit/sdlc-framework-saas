@@ -31,6 +31,7 @@
 #   --tf-root        DIR      Raíz Terraform generada    (default: ./terraform)
 #   --no-lra                  Omite Narayana LRA
 #   --no-wiremock             Omite WireMock
+#   --no-kong                 Omite Kong Gateway (y su integración con Keycloak)
 #   --no-loki                 Omite Loki/Promtail
 #   --no-tempo                Omite Grafana Tempo
 #   --skip-k3s                K3s ya instalado
@@ -71,6 +72,7 @@ INSTALL_LRA=true
 INSTALL_WIREMOCK=true
 INSTALL_LOKI=true
 INSTALL_TEMPO=true
+INSTALL_KONG=true
 SKIP_K3S=false
 SKIP_TF=false
 SKIP_DB=false
@@ -94,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --tf-root)         TF_ROOT="$2";        shift 2 ;;
     --no-lra)          INSTALL_LRA=false;   shift   ;;
     --no-wiremock)     INSTALL_WIREMOCK=false; shift ;;
+    --no-kong)         INSTALL_KONG=false;  shift   ;;
     --no-loki)         INSTALL_LOKI=false;  shift   ;;
     --no-tempo)        INSTALL_TEMPO=false; shift   ;;
     --skip-k3s)        SKIP_K3S=true;       shift   ;;
@@ -134,6 +137,7 @@ generate_terraform() {
     "$TF_ROOT/modules/helm-cicd" \
     "$TF_ROOT/modules/helm-observability" \
     "$TF_ROOT/modules/helm-support" \
+    "$TF_ROOT/modules/helm-gateway" \
     "$TF_ROOT/environments"
 
   # ── providers.tf ────────────────────────────────────────────────────────────
@@ -185,6 +189,8 @@ variable "install_lra"              { type = bool; default = true }
 variable "install_wiremock"         { type = bool; default = true }
 variable "install_loki"             { type = bool; default = true }
 variable "install_tempo"            { type = bool; default = true }
+variable "install_kong"             { type = bool; default = true }
+variable "keycloak_realm"           { type = string; default = "" }
 TFEOF
 
   # ── main.tf ──────────────────────────────────────────────────────────────────
@@ -246,6 +252,16 @@ module "helm_support" {
   install_lra      = var.install_lra
   install_wiremock = var.install_wiremock
 }
+
+# ── API Gateway: Kong (depende de Keycloak para OIDC/JWT) ─────────────────────
+module "helm_gateway" {
+  source          = "./modules/helm-gateway"
+  depends_on      = [module.helm_identity]
+  install_kong    = var.install_kong
+  vm_ip           = var.vm_ip
+  kubeconfig_path = var.kubeconfig_path
+  keycloak_realm  = var.keycloak_realm != "" ? var.keycloak_realm : var.project
+}
 TFEOF
 
   # ── outputs.tf ───────────────────────────────────────────────────────────────
@@ -261,6 +277,8 @@ output "lra_url"         { value = var.install_lra      ? "http://${var.vm_ip}:5
 output "wiremock_url"    { value = var.install_wiremock ? "http://${var.vm_ip}:9999"  : "disabled" }
 output "kafka_bootstrap" { value = "kafka-kafka-bootstrap.messaging.svc.cluster.local:9092" }
 output "otel_grpc"       { value = var.install_tempo ? "tempo.observability.svc.cluster.local:4317" : "disabled" }
+output "kong_proxy_url"  { value = var.install_kong ? "http://${var.vm_ip}:8000" : "disabled" }
+output "kong_admin_url"  { value = var.install_kong ? "kong-kong-admin.gateway.svc.cluster.local:8001 (ClusterIP)" : "disabled" }
 TFEOF
 
   # ── environments/local.tfvars ─────────────────────────────────────────────
@@ -270,6 +288,7 @@ install_lra      = true
 install_wiremock = true
 install_loki     = true
 install_tempo    = true
+install_kong     = true
 pg_admin_password       = "changeme_pg_admin"
 mongo_admin_password    = "changeme_mongo_admin"
 keycloak_admin_password = "changeme_kc_admin"
@@ -284,6 +303,7 @@ install_lra      = true
 install_wiremock = false
 install_loki     = true
 install_tempo    = true
+install_kong     = true
 # Contraseñas: pasar via TF_VAR_xxx — no commitear valores reales aquí
 TFEOF
 
@@ -298,12 +318,14 @@ install_lra      = ${INSTALL_LRA}
 install_wiremock = ${INSTALL_WIREMOCK}
 install_loki     = ${INSTALL_LOKI}
 install_tempo    = ${INSTALL_TEMPO}
+install_kong     = ${INSTALL_KONG}
+keycloak_realm   = "${PROJECT}"
 TFEOF
 
   # ── modules/namespaces/main.tf ────────────────────────────────────────────
   cat > "$TF_ROOT/modules/namespaces/main.tf" << 'TFEOF'
 locals {
-  namespaces = ["infra","identity","secrets","data","messaging","cicd","observability","apps"]
+  namespaces = ["infra","identity","secrets","data","messaging","cicd","observability","gateway","apps"]
 }
 resource "kubernetes_namespace" "ns" {
   for_each = toset(local.namespaces)
@@ -947,6 +969,182 @@ resource "kubernetes_service" "wiremock" {
 }
 TFEOF
 
+  # ── modules/helm-gateway ─────────────────────────────────────────────────
+  cat > "$TF_ROOT/modules/helm-gateway/variables.tf" << 'TFEOF'
+variable "install_kong"    { type = bool;   default = true }
+variable "vm_ip"           { type = string }
+variable "kubeconfig_path" { type = string }
+variable "keycloak_realm"  { type = string }
+TFEOF
+
+  # Script de integración Kong ↔ Keycloak (se ejecuta post-deploy via null_resource)
+  cat > "$TF_ROOT/modules/helm-gateway/kong-keycloak-setup.sh" << 'BASH'
+#!/usr/bin/env bash
+# kong-keycloak-setup.sh — Configura Kong JWT plugin con la clave pública de Keycloak
+set -euo pipefail
+KUBECONFIG_PATH="$1"
+KEYCLOAK_URL="${2:-http://keycloak.identity.svc.cluster.local:8080}"
+KEYCLOAK_REALM="${3:-myproject}"
+
+echo "[INFO] Esperando Kong Admin API..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" wait deploy/kong-kong \
+  -n gateway --for=condition=Available --timeout=120s || true
+
+# Port-forward Kong Admin API (ClusterIP — solo accesible dentro del cluster)
+kubectl --kubeconfig="$KUBECONFIG_PATH" \
+  port-forward -n gateway svc/kong-kong-admin 18001:8001 &>/dev/null &
+PF_PID=$!
+sleep 5
+
+KONG_ADMIN="http://localhost:18001"
+
+echo "[INFO] Obteniendo clave pública de Keycloak (realm: $KEYCLOAK_REALM)..."
+PUBLIC_KEY=$(curl -sf "${KEYCLOAK_URL}/realms/${KEYCLOAK_REALM}" 2>/dev/null \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('public_key',''))" 2>/dev/null || true)
+
+if [[ -n "$PUBLIC_KEY" ]]; then
+  PEM="-----BEGIN PUBLIC KEY-----\n${PUBLIC_KEY}\n-----END PUBLIC KEY-----"
+
+  # Consumer genérico para tokens Keycloak
+  curl -sf -X PUT "${KONG_ADMIN}/consumers/keycloak-users" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"keycloak-users"}' -o /dev/null 2>/dev/null || true
+
+  # Registrar RSA public key como credencial JWT
+  curl -sf -X POST "${KONG_ADMIN}/consumers/keycloak-users/jwt" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"algorithm\": \"RS256\",
+      \"key\":       \"${KEYCLOAK_URL}/realms/${KEYCLOAK_REALM}\",
+      \"rsa_public_key\": \"${PEM}\"
+    }" -o /dev/null 2>/dev/null \
+    && echo "[OK] Clave pública Keycloak registrada en Kong (consumer: keycloak-users)" \
+    || echo "[SKIP] Credencial JWT ya registrada"
+else
+  echo "[WARN] No se pudo obtener la clave pública de Keycloak — configura manualmente"
+fi
+
+# Plugin JWT global (valida tokens en todos los servicios registrados en Kong)
+curl -sf -X POST "${KONG_ADMIN}/plugins" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "jwt",
+    "config": {
+      "key_claim_name":    "iss",
+      "claims_to_verify":  ["exp"],
+      "uri_param_names":   ["jwt"],
+      "cookie_names":      []
+    }
+  }' -o /dev/null 2>/dev/null \
+  && echo "[OK] Plugin JWT global habilitado en Kong" \
+  || echo "[SKIP] Plugin JWT ya configurado"
+
+# Plugin rate-limiting global (protección básica)
+curl -sf -X POST "${KONG_ADMIN}/plugins" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"rate-limiting","config":{"minute":200,"policy":"local"}}' \
+  -o /dev/null 2>/dev/null \
+  && echo "[OK] Plugin rate-limiting global habilitado" || true
+
+# Plugin CORS global
+curl -sf -X POST "${KONG_ADMIN}/plugins" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"cors","config":{"origins":["*"],"methods":["GET","POST","PUT","PATCH","DELETE","OPTIONS"],"headers":["Authorization","Content-Type","Accept"],"exposed_headers":["X-Auth-Token"],"credentials":true,"max_age":3600}}' \
+  -o /dev/null 2>/dev/null \
+  && echo "[OK] Plugin CORS global habilitado" || true
+
+kill $PF_PID 2>/dev/null || true
+echo "[OK] Configuración Kong-Keycloak completada"
+BASH
+
+  cat > "$TF_ROOT/modules/helm-gateway/main.tf" << 'TFEOF'
+# Añadir repo Kong a Helm antes de usar este módulo:
+#   helm repo add kong https://charts.konghq.com && helm repo update
+
+resource "helm_release" "kong" {
+  count = var.install_kong ? 1 : 0
+
+  name       = "kong"
+  repository = "https://charts.konghq.com"
+  chart      = "kong"
+  version    = "2.38.0"
+  namespace  = "gateway"
+  wait       = true
+  timeout    = 300
+
+  values = [<<-YAML
+    # Modo DB-less: no requiere PostgreSQL
+    env:
+      database: "off"
+
+    # Proxy (entrada de tráfico de usuarios)
+    proxy:
+      type: NodePort
+      http:
+        enabled: true
+        nodePort: 8000
+      tls:
+        enabled: false
+
+    # Admin API (solo ClusterIP — no exponer al exterior)
+    admin:
+      enabled: true
+      type: ClusterIP
+      http:
+        enabled: true
+
+    # Ingress Controller (gestión de rutas via KongIngress / HTTPRoute)
+    ingressController:
+      enabled: true
+      installCRDs: true
+      env:
+        kong_admin_url: http://localhost:8001
+
+    resources:
+      requests:
+        memory: 256Mi
+        cpu:    100m
+      limits:
+        memory: 512Mi
+        cpu:    "500m"
+  YAML
+  ]
+}
+
+# Agregar repo Kong al cluster (necesario antes del apply)
+resource "null_resource" "kong_helm_repo" {
+  count      = var.install_kong ? 1 : 0
+  depends_on = []
+
+  provisioner "local-exec" {
+    command = <<-CMD
+      helm --kubeconfig='${var.kubeconfig_path}' repo add kong https://charts.konghq.com 2>/dev/null || true
+      helm --kubeconfig='${var.kubeconfig_path}' repo update
+    CMD
+  }
+  triggers = { always = timestamp() }
+}
+
+# Configurar Kong con JWT plugin + clave pública Keycloak
+resource "null_resource" "kong_keycloak_setup" {
+  count      = var.install_kong ? 1 : 0
+  depends_on = [helm_release.kong]
+
+  provisioner "local-exec" {
+    command = <<-CMD
+      bash '${path.module}/kong-keycloak-setup.sh' \
+        '${var.kubeconfig_path}' \
+        'http://keycloak.identity.svc.cluster.local:8080' \
+        '${var.keycloak_realm}'
+    CMD
+  }
+  triggers = {
+    kong_version   = var.install_kong ? helm_release.kong[0].version : "disabled"
+    keycloak_realm = var.keycloak_realm
+  }
+}
+TFEOF
+
   log_ok "Estructura Terraform generada en $TF_ROOT"
 }
 
@@ -1124,6 +1322,7 @@ print_summary() {
   log "  Vault:       http://$VM_IP:8200  (ver vault-init.json)"
   log "  Grafana:     http://$VM_IP:3001"
   log "  Prometheus:  http://$VM_IP:9090"
+  [[ "$INSTALL_KONG" == true ]]     && log "  Kong Proxy:  http://$VM_IP:8000  (API gateway → servicios)"
   [[ "$INSTALL_LRA" == true ]]      && log "  LRA:         http://$VM_IP:50000"
   [[ "$INSTALL_WIREMOCK" == true ]] && log "  WireMock:    http://$VM_IP:9999"
   log ""

@@ -314,13 +314,22 @@ def get_env_local(project_name: str) -> str:
 NEXTAUTH_URL=http://localhost:3000
 NEXTAUTH_SECRET=dev-secret-change-in-production
 
-# Cognito local (floci)
-COGNITO_CLIENT_ID=dev-client-id
-COGNITO_CLIENT_SECRET=dev-client-secret
-COGNITO_ISSUER=http://localhost:9229
+# Keycloak (K3s local — VPS_IP:8082)
+# Exportar VPS_IP antes de iniciar: export VPS_IP=192.168.122.50
+KEYCLOAK_URL=http://${{VPS_IP:-localhost}}:8082
+KEYCLOAK_REALM={project_name}
+KEYCLOAK_CLIENT_ID=frontend
+KEYCLOAK_CLIENT_SECRET=changeme_frontend_client
+KEYCLOAK_ISSUER=http://${{VPS_IP:-localhost}}:8082/realms/{project_name}
 
-# API Gateway local
-NEXT_PUBLIC_API_BASE_URL=http://localhost:4567/v1
+# Backend API — via Kong Gateway (port 8000)
+# Kong valida JWT de Keycloak y enruta a los microservicios en K3s
+NEXT_PUBLIC_API_BASE_URL=http://${{VPS_IP:-localhost}}:8000
+
+# Configuración de la app
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+NEXT_PUBLIC_APP_NAME={project_name}
+NEXT_PUBLIC_APP_ENV=development
 """
 
 
@@ -329,9 +338,9 @@ def get_env_example(project_name: str) -> str:
 # ======================================================================
 # Environment Variables Template - {project_name}
 # ======================================================================
-# This file documents all required variables.
-# The actual .env.local is pre-filled with development defaults.
-# For staging/production, set real values in your deployment platform.
+# Este archivo documenta todas las variables requeridas.
+# .env.local ya tiene defaults para dev (apuntan al VPS local).
+# Para prod: usar las URLs del VPS Oracle Cloud OCI.
 # ======================================================================
 
 # App
@@ -339,14 +348,20 @@ NEXT_PUBLIC_APP_URL=https://your-domain.com
 NEXT_PUBLIC_APP_NAME={project_name}
 NEXT_PUBLIC_APP_ENV=production
 
-# API
-NEXT_PUBLIC_API_URL=https://api.your-domain.com/api/v1
-API_SECRET_KEY=
+# Backend API — via Kong Gateway (port 8000 en dev / 443 en prod con TLS)
+# Kong valida JWT de Keycloak antes de enrutar a los microservicios
+NEXT_PUBLIC_API_BASE_URL=https://your-domain.com:8000
 
-# Auth
+# Auth — NextAuth
 NEXTAUTH_URL=https://your-domain.com
 NEXTAUTH_SECRET=
-JWT_SECRET=
+
+# Keycloak (desplegado en K3s via Helm — módulo helm-identity)
+KEYCLOAK_URL=http://VPS_OCI_IP:8082
+KEYCLOAK_REALM={project_name}
+KEYCLOAK_CLIENT_ID=frontend
+KEYCLOAK_CLIENT_SECRET=
+KEYCLOAK_ISSUER=http://VPS_OCI_IP:8082/realms/{project_name}
 
 # Feature Flags
 NEXT_PUBLIC_ENABLE_ANALYTICS=false
@@ -769,7 +784,7 @@ const envSchema = z.object({
   NEXT_PUBLIC_APP_NAME: z.string().min(1).default('App'),
   NEXT_PUBLIC_APP_ENV: z.enum(['development', 'staging', 'production']).default('development'),
   NEXT_PUBLIC_API_URL: z.preprocess(
-    (v) => (v && String(v).trim()) || 'http://localhost:8080/api/v1',
+    (v) => (v && String(v).trim()) || 'http://localhost:8000',
     z.string().url()
   ),
   NEXT_PUBLIC_ENABLE_ANALYTICS: z
@@ -1893,11 +1908,12 @@ def get_jenkinsfile(org: str = "myproject") -> str:
 
 // ───────────────────────────────────────────────────────────────────────────
 // Jenkinsfile (frontend Next.js) — build Docker + push Gitea Package Registry
-// + bumpImageTag → ArgoCD despliega como pod K3s con Ingress Traefik.
+// + bumpImageTag → ArgoCD ApplicationSet despliega como pod K3s con Ingress Traefik.
 //
-// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero (K3s VPS en
-// dev, EKS en staging/prod) con contenedores 'node' y 'kaniko' (definidos en
-// org/__LIB_ORG__/podFrontend.yaml de la Shared Library).
+// Modelo de agentes: Kubernetes plugin. Corre en un pod efímero en K3s nativo
+// en VPS (local QEMU en dev, Oracle Cloud OCI en prod) con contenedores 'node'
+// y 'kaniko' (definidos en org/__LIB_ORG__/podFrontend.yaml de la Shared Library).
+// Imágenes publicadas en Gitea Package Registry (VPS_IP:3000/<org>).
 // ───────────────────────────────────────────────────────────────────────────
 
 pipeline {
@@ -1983,8 +1999,8 @@ pipeline {
         }
 
         // 9 — Frontera CI → CD: escribe image.repository/tag en
-        //     terraform/frontend/environments/<env>/values.yaml y commitea (GitOps).
-        //     ArgoCD detecta el commit y actualiza el pod K3s.
+        //     charts/frontend/values-<env>.yaml del repo <org>-helm-charts y commitea.
+        //     ArgoCD ApplicationSet (Git generator) detecta el commit y actualiza el pod K3s.
         stage('Update GitOps (image tag)') {
             steps {
                 bumpImageTag(
@@ -2014,21 +2030,177 @@ pipeline {
     return template.replace("__LIB_ORG__", lib_org)
 
 
-def get_vercel_json() -> str:
-    """vercel.json con la Git integration DESACTIVADA.
+def get_helm_chart_frontend(project_name: str, port: int = 3000) -> dict:
+    """Helm chart del frontend para ArgoCD ApplicationSet (Git generator).
 
-    Garantiza que el único disparador de despliegues sea Jenkins (deploy vía
-    Vercel CLI).
+    El chart se sube al repo <org>-helm-charts/charts/frontend/ en Gitea.
+    ArgoCD lo descubre automáticamente via el Git generator del ApplicationSet
+    provisionado por base-infrastructure-builder.sh.
+    bumpImageTag() de la Shared Library actualiza values-<env>.yaml con el nuevo tag.
     """
-    return """\
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "nextjs",
-  "git": {
-    "deploymentEnabled": false
-  }
-}
+    chart_yaml = f"""\
+apiVersion: v2
+name: frontend
+description: Frontend Next.js para {project_name} (K3s + Traefik Ingress)
+type: application
+version: 0.1.0
+appVersion: "latest"
 """
+
+    values_yaml = f"""\
+replicaCount: 1
+
+image:
+  repository: ""   # <VPS_IP>:3000/<org>/frontend — definido en values-<env>.yaml
+  tag: ""          # <version>-<sha> inmutable — escrito por bumpImageTag (Jenkins)
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: gitea-registry-secret
+
+service:
+  type: ClusterIP
+  port: {port}
+
+ingress:
+  enabled: true
+  className: traefik
+  host: ""
+  path: /
+  pathType: Prefix
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+env: []
+"""
+
+    image_block = """\
+# image.repository/tag los escribe bumpImageTag (Jenkins); ArgoCD los lee.
+image:
+  repository: ""
+  tag: ""
+"""
+    values_local = image_block + """\
+replicaCount: 1
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+"""
+    values_dev   = values_local
+    values_prod  = image_block + """\
+replicaCount: 2
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+"""
+
+    deployment_tpl = f"""\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{{{ .Release.Name }}}}
+  labels:
+    app: {{{{ .Release.Name }}}}
+spec:
+  replicas: {{{{ .Values.replicaCount }}}}
+  selector:
+    matchLabels:
+      app: {{{{ .Release.Name }}}}
+  template:
+    metadata:
+      labels:
+        app: {{{{ .Release.Name }}}}
+    spec:
+      imagePullSecrets:
+        {{{{- toYaml .Values.imagePullSecrets | nindent 8 }}}}
+      containers:
+        - name: frontend
+          image: "{{{{ .Values.image.repository }}}}:{{{{ .Values.image.tag }}}}"
+          imagePullPolicy: {{{{ .Values.image.pullPolicy }}}}
+          ports:
+            - containerPort: {port}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {port}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: {port}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{{{- toYaml .Values.resources | nindent 12 }}}}
+          {{{{- with .Values.env }}}}
+          env:
+            {{{{- toYaml . | nindent 12 }}}}
+          {{{{- end }}}}
+"""
+
+    service_tpl = """\
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+      protocol: TCP
+"""
+
+    ingress_tpl = """\
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host | default "" }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ .Release.Name }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
+"""
+
+    return {
+        "Chart.yaml":              chart_yaml,
+        "values.yaml":             values_yaml,
+        "values-local.yaml":       values_local,
+        "values-dev.yaml":         values_dev,
+        "values-prod.yaml":        values_prod,
+        "templates/deployment.yaml": deployment_tpl,
+        "templates/service.yaml":  service_tpl,
+        "templates/ingress.yaml":  ingress_tpl,
+    }
 
 
 def get_dockerignore() -> str:
@@ -2147,6 +2319,7 @@ def scaffold(project_name: str, org: str = "myproject") -> None:
         "Dockerfile": get_dockerfile(),
         ".dockerignore": get_dockerignore(),
         "Jenkinsfile": get_jenkinsfile(org),
+        # Nota: vercel.json NO se genera — despliegue via K3s + ArgoCD + Gitea Package Registry
 
         # Middleware (Next.js root)
         "src/middleware.ts": get_middleware(),
@@ -2247,8 +2420,18 @@ def scaffold(project_name: str, org: str = "myproject") -> None:
         file_path.write_text(content, encoding="utf-8")
         logger.debug("Creado: %s", relative_path)
 
+    # Helm chart local (referencia) — la copia canónica va en <org>-helm-charts/charts/frontend/
+    helm_root = root / "helm" / "frontend"
+    for rel_path, content in get_helm_chart_frontend(project_name).items():
+        target = helm_root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        logger.debug("Helm chart: %s", rel_path)
+    logger.info("Helm chart generado en: %s", helm_root)
+
     logger.info("Arquetipo generado exitosamente en: %s", root.resolve())
     _setup_gitea_repo(project_name, root, org)
+    _push_helm_chart_to_gitea(project_name, helm_root, org)
     _print_run_instructions(project_name, root)
 
 
@@ -2258,18 +2441,20 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
     import subprocess
     import urllib.error
     import urllib.request
-
     import os
+
     vps_ip = os.environ.get("VPS_IP", "")
     gitea_host = f"http://{vps_ip}:3000" if vps_ip else "http://localhost:3000"
-    credentials = base64.b64encode(b"gitea-admin:gitea-admin").decode()
+    gitea_user = os.environ.get("GITEA_USER", "gitea_admin")
+    gitea_pass = os.environ.get("GITEA_PASS", "changeme_gitea_admin")
+    credentials = base64.b64encode(f"{gitea_user}:{gitea_pass}".encode()).decode()
 
     try:
         urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
     except Exception:
         logger.warning(
-            "[Gitea] No activo en %s — crear el repo manualmente "
-            "(VPS_IP=%s, base-infrastructure-builder.sh --vps-ip).", gitea_host, vps_ip or "no definido"
+            "[Gitea] No activo en %s — crear el repo manualmente tras correr "
+            "base-infrastructure-builder.sh (VPS_IP=%s).", gitea_host, vps_ip or "no definido"
         )
         return
 
@@ -2293,8 +2478,8 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
             logger.info("[Gitea] Repo %s/%s ya existe.", org, project_name)
         elif e.code == 401:
             logger.warning(
-                "[Gitea] HTTP 401: el usuario admin no existe. Correr "
-                "base-infrastructure-builder.sh primero."
+                "[Gitea] HTTP 401: credenciales inválidas. "
+                "Exportar GITEA_USER y GITEA_PASS o correr base-infrastructure-builder.sh primero."
             )
             return
         else:
@@ -2312,18 +2497,84 @@ def _setup_gitea_repo(project_name: str, root: Path, org: str = "myproject") -> 
         remote_url = f"{gitea_host}/{org}/{project_name}.git"
         subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=root, check=False)
         logger.info("[Gitea] Remote 'origin' → %s", remote_url)
-        logger.info("[Gitea] URL para Jenkins/ArgoCD: %s/%s/%s.git", gitea_host, org, project_name)
-        # Auto-push con credenciales embebidas (sin guardarlas en .git/config).
-        push_url = remote_url.replace("http://", "http://gitea-admin:gitea-admin@", 1)
-        push = subprocess.run(
-            ["git", "push", push_url, "main"], cwd=root, capture_output=True
-        )
+        push_url = remote_url.replace("http://", f"http://{gitea_user}:{gitea_pass}@", 1)
+        push = subprocess.run(["git", "push", push_url, "main"], cwd=root, capture_output=True)
         if push.returncode == 0:
             logger.info("[Gitea] Push a %s/%s completado (rama main).", org, project_name)
         else:
             logger.info("[Gitea] Para publicar: cd %s && git push -u origin main", root)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning("[Gitea] No se pudo inicializar el repo git: %s", e)
+
+
+def _push_helm_chart_to_gitea(project_name: str, helm_root: Path, org: str = "myproject") -> None:
+    """Sube el Helm chart del frontend al repo <org>-helm-charts/charts/frontend/ en Gitea.
+
+    ArgoCD ApplicationSet (Git generator) lo descubre automáticamente.
+    """
+    import base64
+    import json as _json
+    import urllib.error
+    import urllib.request
+    import os
+
+    vps_ip = os.environ.get("VPS_IP", "")
+    gitea_host = f"http://{vps_ip}:3000" if vps_ip else "http://localhost:3000"
+    gitea_user = os.environ.get("GITEA_USER", "gitea_admin")
+    gitea_pass = os.environ.get("GITEA_PASS", "changeme_gitea_admin")
+    credentials = base64.b64encode(f"{gitea_user}:{gitea_pass}".encode()).decode()
+    helm_charts_repo = f"{org}-helm-charts"
+
+    try:
+        urllib.request.urlopen(f"{gitea_host}/api/healthz", timeout=3)
+    except Exception:
+        logger.warning(
+            "[Gitea helm-charts] No activo — subir manualmente %s a %s/charts/frontend/",
+            helm_root, helm_charts_repo
+        )
+        return
+
+    def put_file(file_path: str, content: str) -> None:
+        encoded = base64.b64encode(content.encode()).decode()
+        sha = ""
+        try:
+            req = urllib.request.Request(
+                f"{gitea_host}/api/v1/repos/{org}/{helm_charts_repo}/contents/{file_path}",
+                headers={"Authorization": f"Basic {credentials}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                sha = _json.loads(r.read())["sha"]
+        except urllib.error.HTTPError:
+            pass
+
+        payload: dict = {"message": f"ci: scaffold frontend helm chart ({file_path})", "content": encoded}
+        if sha:
+            payload["sha"] = sha
+
+        req = urllib.request.Request(
+            f"{gitea_host}/api/v1/repos/{org}/{helm_charts_repo}/contents/{file_path}",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}"},
+            method="PUT",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            logger.debug("[Gitea helm-charts] %s subido.", file_path)
+        except urllib.error.HTTPError as e:
+            logger.warning("[Gitea helm-charts] No se pudo subir %s: HTTP %s", file_path, e.code)
+
+    for file in helm_root.rglob("*"):
+        if file.is_file():
+            rel = file.relative_to(helm_root.parent.parent)  # relativo a project root
+            # Sube como charts/frontend/<...> en el repo helm-charts
+            remote_path = f"charts/frontend/{file.relative_to(helm_root)}"
+            put_file(remote_path, file.read_text(encoding="utf-8"))
+
+    logger.info(
+        "[ArgoCD] Helm chart 'frontend' subido a %s/charts/frontend/ — "
+        "ApplicationSet lo sincronizará automáticamente.",
+        helm_charts_repo
+    )
 
 
 def _print_run_instructions(project_name: str, root: Path) -> None:
