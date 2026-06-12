@@ -25,6 +25,26 @@ Requerimiento del cliente
 [Paso 5] /strategic-design-sdd              →  docs/strategic-design/SDD-<proyecto>-domain.md
                                                 docs/strategic-design/SDD-<proyecto>-security.md
                                                 docs/strategic-design/SDD-<proyecto>-architecture.md
+        │
+        ▼
+[Paso 6] /technical-design-sdd              →  docs/design/SDD-<proyecto>-system.md
+                                                docs/design/SDD-<proyecto>-design.md
+                                                docs/design/SDD-<proyecto>-infrastructure.md
+                                                docs/design/diagrams/SDD-<proyecto>-c4-context.mmd
+                                                docs/design/diagrams/SDD-<proyecto>-c4-container.mmd
+                                                docs/design/api/SDD-<proyecto>-openapi.yaml
+                                                docs/design/database/SDD-<proyecto>-schema.sql
+        │
+        ▼
+[Paso 7] /development-plan                  →  docs/development/DEV-<proyecto>-roadmap.md
+                                                docs/development/DEV-<proyecto>-00-infrastructure.md
+                                                docs/development/DEV-<proyecto>-0c-observability.md
+                                                docs/development/DEV-<proyecto>-01-databases.md
+                                                docs/development/DEV-<proyecto>-02-scaffold.md
+                                                docs/development/DEV-<proyecto>-02b-cicd.md
+                                                docs/development/DEV-<proyecto>-03-ms-<servicio>.md
+                                                docs/development/DEV-<proyecto>-04-fe-<feature>.md
+                                                docs/development/DEV-<proyecto>-05-tests.md
 ```
 
 ---
@@ -256,41 +276,213 @@ Tres documentos complementarios que conforman el **Strategic Design Document (SD
 
 ---
 
+## Paso 6 — Etapa SDLC: Diseño Técnico del Sistema
+
+**Skill:** `/technical-design-sdd`  
+**Entrada:** documentos del Diseño Estratégico generados en el Paso 5 (buscados automáticamente en `docs/strategic-design/`)  
+**Salida:** tres documentos `.md` + cuatro artefactos independientes en `docs/design/`
+
+### Instrucciones
+
+Sin argumentos (lee automáticamente los SDD de `docs/strategic-design/`):
+
+```
+/technical-design-sdd
+```
+
+Con ruta explícita:
+
+```
+/technical-design-sdd docs/strategic-design/
+/technical-design-sdd docs/strategic-design/SDD-<nombre-proyecto>-architecture.md
+```
+
+### Qué genera
+
+Tres documentos técnicos complementarios y cuatro artefactos independientes:
+
+#### `SDD-<proyecto>-system.md` — Arquitectura del Sistema
+
+1. Introducción
+2. Arquitectura General + diagramas C4 (contexto y contenedores en Mermaid)
+3. Stack Tecnológico — K3s, Terraform + provider Helm, Keycloak, HashiCorp Vault, Kong Gateway, Gitea, Jenkins, ArgoCD, MinIO
+4. Componentes del Sistema
+5. Diseño de Módulos
+
+#### `SDD-<proyecto>-design.md` — Diseño Técnico
+
+1. Diseño de APIs (referencia a `openapi.yaml`)
+2. Diseño de Persistencia — patrón Database-per-Service; changelogs Liquibase en repo `<proyecto>-migrations`; `init-databases.sh`
+3. Flujos Técnicos Principales (incluyendo flujos de Saga con Camel + Narayana LRA si aplica)
+4. Diseño de Seguridad Técnica
+5. Especificación de Pruebas ATDD (trazabilidad AC-xxx → prueba técnica)
+
+#### `SDD-<proyecto>-infrastructure.md` — Infraestructura y Gobernanza
+
+1. Infraestructura y Deployment — `base-infrastructure-builder.sh` genera `terraform/`, instala K3s y ejecuta `terraform apply` con provider Helm
+2. Observabilidad y Monitoreo — kube-prometheus-stack + Loki + Promtail + Grafana Tempo
+3. Consideraciones No Funcionales
+4. Decisiones Técnicas (ADR) — Database-per-Service, Camel, Saga, Outbox, Vault
+5. Riesgos Técnicos
+6. Recomendación y Próximos Pasos — secuencia de scripts de aprovisionamiento
+
+#### Artefactos independientes
+
+| Artefacto | Ruta |
+|-----------|------|
+| Diagrama C4 Contexto (Mermaid) | `docs/design/diagrams/SDD-<proyecto>-c4-context.mmd` |
+| Diagrama C4 Contenedores (Mermaid) | `docs/design/diagrams/SDD-<proyecto>-c4-container.mmd` |
+| Especificación OpenAPI 3.0 | `docs/design/api/SDD-<proyecto>-openapi.yaml` |
+| Modelo de datos SQL (DDL) | `docs/design/database/SDD-<proyecto>-schema.sql` |
+| Modelo MongoDB (colecciones) | `docs/design/database/SDD-<proyecto>-collections.js` |
+
+### Notas
+
+- El stack del framework es fijo: K3s + Terraform + Helm (ambos entornos `local` y `prod`); sin EKS, sin AWS Cognito, sin floci.
+- Si el ADC declara CQRS, se generan decisiones encadenadas: Projection Service (Spring Boot reactivo) + `<prefix>_readmodel` (PostgreSQL) + `report-etl-service` (Spark batch).
+- Si el ADC declara integración con sistemas externos, el diagrama C4 incluye el `integration-service` (Apache Camel) entre los microservicios y los sistemas externos.
+- El `schema.sql` usa comentarios `-- BC-XX:` para delimitar tablas por microservicio; cada bloque es el input del changelog Liquibase `00001_initial_schema.yaml` del repo `<proyecto>-migrations`.
+
+---
+
+## Paso 7 — Etapa SDLC: Implementación
+
+**Skill:** `/development-plan`  
+**Entrada:** documentos del Diseño Técnico generados en el Paso 6 (buscados automáticamente en `docs/design/`)  
+**Salida:** conjunto de planes de desarrollo en `docs/development/`
+
+### Instrucciones
+
+Sin argumentos (lee automáticamente los artefactos de `docs/design/`):
+
+```
+/development-plan
+```
+
+Con ruta explícita:
+
+```
+/development-plan docs/design/
+/development-plan docs/design/SDD-<nombre-proyecto>-system.md
+```
+
+### Qué genera
+
+Un **roadmap maestro** y planes de desarrollo detallados por etapa, en el siguiente orden:
+
+| Documento | Etapa | Descripción |
+|-----------|-------|-------------|
+| `DEV-<proyecto>-roadmap.md` | Roadmap | Índice maestro, secuencia de etapas, mapa de microservicios y features |
+| `DEV-<proyecto>-00-infrastructure.md` | Etapa 0 | K3s + Terraform + Helm: `base-infrastructure-builder.sh` genera `terraform/`, instala K3s, deploya todo con provider Helm |
+| `DEV-<proyecto>-0c-observability.md` | Etapa 0c | Verificación del stack de observabilidad instalado en Etapa 0: Prometheus, Grafana, Loki, Promtail, Grafana Tempo (OTEL → `tempo.observability.svc.cluster.local:4317`) |
+| `DEV-<proyecto>-01-databases.md` | Etapa 1 | BDs aisladas por servicio con `init-databases.sh`; changelogs Liquibase via `run-liquibase-migrations.sh` |
+| `DEV-<proyecto>-02-scaffold.md` | Etapa 2 | Scaffolding con `scaffold-all-services.sh`; secrets en HashiCorp Vault con `create-all-secrets-vault.sh` |
+| `DEV-<proyecto>-02b-cicd.md` | Etapa 2b | Pipeline CI/CD: Jenkins (pod K3s) + ArgoCD (Git generator sobre `<org>-helm-charts`) |
+| `DEV-<proyecto>-03-ms-<servicio>.md` | Etapa 3 | Un documento por microservicio (TDD capa a capa: dominio → aplicación → infraestructura → rest-api) |
+| `DEV-<proyecto>-04-fe-<feature>.md` | Etapa 4 | Un documento por feature frontend (TDD: schemas Zod → hooks TanStack → componentes → E2E Playwright) |
+| `DEV-<proyecto>-05-tests.md` | Etapa 5 | Pruebas de integración, contrato, E2E, estrés y carga; verificación E2E de observabilidad |
+
+### Ambiente objetivo
+
+Todos los documentos generados apuntan al ambiente K3s del VPS:
+
+| Componente | Endpoint | Namespace K3s |
+|-----------|----------|---------------|
+| Gitea (registry + SCM) | `http://VPS_IP:3000` | `cicd` |
+| Jenkins | `http://VPS_IP:8080` | `cicd` |
+| ArgoCD | `http://VPS_IP:8081` | `cicd` |
+| Keycloak | `http://VPS_IP:8082` | `identity` |
+| HashiCorp Vault | `http://VPS_IP:8200` | `secrets` |
+| Kong Gateway (proxy) | `http://VPS_IP:8000` | `gateway` |
+| MinIO | `http://VPS_IP:9000` | `infra` |
+| Prometheus | `http://VPS_IP:9090` | `observability` |
+| Grafana | `http://VPS_IP:3001` | `observability` |
+
+### Notas
+
+- **TDD obligatorio y transversal**: ningún componente se implementa sin una prueba previa (Red-Green-Refactor). Backend: JUnit 5 + StepVerifier + Testcontainers + WebTestClient. Frontend: Vitest + RTL + MSW + Playwright.
+- Los microservicios usan Spring Boot reactivo (WebFlux / R2DBC); sus `application.yml` leen configuración desde Vault (`spring.config.import: optional:vault://…`).
+- La autenticación usa **Keycloak** (OAuth2/OIDC); el frontend apunta a `KEYCLOAK_URL` y las APIs se exponen vía **Kong Gateway**.
+- Los Helm charts de cada servicio se gestionan en el repo `<org>-helm-charts` en Gitea; ArgoCD los auto-descubre con un Git generator.
+- Entornos: `local` (VM QEMU/KVM) y `prod` (Oracle Cloud OCI); sin EKS, sin floci, sin AWS Cognito.
+
+---
+
 ## Estructura de Directorios
 
 ```
 sdlc-framework-saas/
 ├── requerimiento/                  # Paso 1: requerimientos diligenciados por el cliente
 ├── docs/
-│   ├── planning/                   # Paso 2 y 4: PIDs y ADCs del proyecto
+│   ├── planning/                   # Pasos 2 y 4: PIDs y ADCs del proyecto
 │   ├── requirements/               # Paso 3: SRS generados por /requirements-srs
-│   └── strategic-design/           # Paso 5: SDD generados por /strategic-design-sdd
-│       ├── SDD-<proyecto>-domain.md
-│       ├── SDD-<proyecto>-security.md
-│       └── SDD-<proyecto>-architecture.md
+│   ├── strategic-design/           # Paso 5: SDD generados por /strategic-design-sdd
+│   │   ├── SDD-<proyecto>-domain.md
+│   │   ├── SDD-<proyecto>-security.md
+│   │   └── SDD-<proyecto>-architecture.md
+│   ├── design/                     # Paso 6: SDD técnicos generados por /technical-design-sdd
+│   │   ├── SDD-<proyecto>-system.md
+│   │   ├── SDD-<proyecto>-design.md
+│   │   ├── SDD-<proyecto>-infrastructure.md
+│   │   ├── diagrams/
+│   │   │   ├── SDD-<proyecto>-c4-context.mmd
+│   │   │   └── SDD-<proyecto>-c4-container.mmd
+│   │   ├── api/
+│   │   │   └── SDD-<proyecto>-openapi.yaml
+│   │   └── database/
+│   │       ├── SDD-<proyecto>-schema.sql
+│   │       └── SDD-<proyecto>-collections.js
+│   └── development/                # Paso 7: planes generados por /development-plan
+│       ├── DEV-<proyecto>-roadmap.md
+│       ├── DEV-<proyecto>-00-infrastructure.md
+│       ├── DEV-<proyecto>-0c-observability.md
+│       ├── DEV-<proyecto>-01-databases.md
+│       ├── DEV-<proyecto>-02-scaffold.md
+│       ├── DEV-<proyecto>-02b-cicd.md
+│       ├── DEV-<proyecto>-03-ms-<servicio>.md
+│       ├── DEV-<proyecto>-04-fe-<feature>.md
+│       └── DEV-<proyecto>-05-tests.md
 └── .claude/
     ├── formatos/
     │   ├── input-template.md           # Plantilla de captura del requerimiento (Paso 1)
     │   └── input-adc-template.md       # Plantilla de contexto arquitectónico (Paso 4)
+    ├── scripts/                        # Scripts de automatización de infraestructura
+    │   ├── base-infrastructure-builder.sh   # K3s + Terraform + Helm
+    │   ├── init-databases.sh               # Database-per-Service (PostgreSQL/MongoDB K3s)
+    │   ├── create-all-secrets-vault.sh     # Secrets en HashiCorp Vault
+    │   ├── run-liquibase-migrations.sh     # Migraciones Liquibase standalone
+    │   ├── scaffold-all-services.sh        # Scaffolding de microservicios y frontend
+    │   ├── setup-cicd-pipeline.sh          # Jenkins + ArgoCD pipeline
+    │   ├── jenkins-shared-library-builder.sh
+    │   └── init-dev-environment.sh         # Verificación del ambiente
+    ├── templates/                      # Scaffolders de proyectos
+    │   ├── maven_hexagonal_scaffold.py     # Spring Boot hexagonal (Maven)
+    │   ├── scala_hexagonal_scaffold.py     # Spark/Scala hexagonal (sbt)
+    │   ├── integration_service_scaffold.py # Apache Camel + Saga
+    │   ├── nextjs_feature_scaffold.py      # Next.js feature-based
+    │   └── report_lambdas_scaffold.py      # Lambdas de formatos PDF/XLS/CSV
     └── skills/
         ├── plan-pid/                   # Skill de planeación
         ├── requirements-srs/           # Skill de análisis de requerimientos
-        └── strategic-design-sdd/       # Skill de diseño estratégico
+        ├── strategic-design-sdd/       # Skill de diseño estratégico
+        ├── technical-design-sdd/       # Skill de diseño técnico
+        ├── development-plan/           # Skill de plan de implementación
+        └── observability-plan/         # Skill de plan de observabilidad
 ```
 
 ---
 
 ## Etapas del SDLC Implementadas
 
-| # | Etapa | Skill | Estado |
-|---|-------|-------|--------|
-| 1 | Captura de requerimiento | — (template manual) | Disponible |
-| 2 | Planeación | `/plan-pid` | Disponible |
-| 3 | Análisis de Requerimientos | `/requirements-srs` | Disponible |
-| 4 | Contexto Arquitectónico | — (template manual ADC) | Disponible |
-| 5 | Diseño Estratégico | `/strategic-design-sdd` | Disponible |
-| 6 | Diseño Técnico del Sistema | — | Próximamente |
-| 7 | Desarrollo | — | Próximamente |
-| 8 | Pruebas | — | Próximamente |
-| 9 | Despliegue | — | Próximamente |
-| 10 | Mantenimiento | — | Próximamente |
+| # | Etapa | Skill | Salida principal | Estado |
+|---|-------|-------|-----------------|--------|
+| 1 | Captura de requerimiento | — (template manual) | `requerimiento/<proyecto>.md` | Disponible |
+| 2 | Planeación | `/plan-pid` | `docs/planning/PID-<proyecto>.md` | Disponible |
+| 3 | Análisis de Requerimientos | `/requirements-srs` | `docs/requirements/SRS-<proyecto>.md` | Disponible |
+| 4 | Contexto Arquitectónico | — (template manual ADC) | `docs/planning/ADC-<proyecto>.md` | Disponible |
+| 5 | Diseño Estratégico | `/strategic-design-sdd` | `docs/strategic-design/SDD-<proyecto>-*.md` (×3) | Disponible |
+| 6 | Diseño Técnico del Sistema | `/technical-design-sdd` | `docs/design/SDD-<proyecto>-*.md` (×3) + artefactos | Disponible |
+| 7 | Implementación | `/development-plan` | `docs/development/DEV-<proyecto>-*.md` (roadmap + etapas) | Disponible |
+| 8 | Pruebas | — | — | Próximamente |
+| 9 | Despliegue | — | — | Próximamente |
+| 10 | Mantenimiento | — | — | Próximamente |
