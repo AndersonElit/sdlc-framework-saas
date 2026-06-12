@@ -45,6 +45,12 @@ Requerimiento del cliente
                                                 docs/development/DEV-<proyecto>-03-ms-<servicio>.md
                                                 docs/development/DEV-<proyecto>-04-fe-<feature>.md
                                                 docs/development/DEV-<proyecto>-05-tests.md
+        │
+        ▼
+[Paso 8] /testing-plan                      →  docs/testing/QA-<proyecto>-plan.md
+                                                docs/testing/QA-<proyecto>-acceptance.md
+                                                docs/testing/QA-<proyecto>-e2e.md
+                                                docs/testing/QA-<proyecto>-performance.md
 ```
 
 ---
@@ -380,7 +386,7 @@ Un **roadmap maestro** y planes de desarrollo detallados por etapa, en el siguie
 | `DEV-<proyecto>-02b-cicd.md` | Etapa 2b | Pipeline CI/CD: Jenkins (pod K3s) + ArgoCD (Git generator sobre `<org>-helm-charts`) |
 | `DEV-<proyecto>-03-ms-<servicio>.md` | Etapa 3 | Un documento por microservicio (TDD capa a capa: dominio → aplicación → infraestructura → rest-api) |
 | `DEV-<proyecto>-04-fe-<feature>.md` | Etapa 4 | Un documento por feature frontend (TDD: schemas Zod → hooks TanStack → componentes → E2E Playwright) |
-| `DEV-<proyecto>-05-tests.md` | Etapa 5 | Pruebas de integración, contrato, E2E, estrés y carga; verificación E2E de observabilidad |
+| `DEV-<proyecto>-05-tests.md` | Etapa 5 | Pruebas de integración y contrato entre servicios; saga (happy path y compensación); WireMock para sistemas externos |
 
 ### Ambiente objetivo
 
@@ -398,6 +404,16 @@ Todos los documentos generados apuntan al ambiente K3s del VPS:
 | Prometheus | `http://VPS_IP:9090` | `observability` |
 | Grafana | `http://VPS_IP:3001` | `observability` |
 
+### Separación de responsabilidades en pruebas
+
+| Nivel | Tipo | Responsable | Skill / Etapa |
+|---|---|---|---|
+| Unitarias (TDD) | Por capa: dominio, aplicación, infraestructura, REST | Desarrolladores | Etapas 3 y 4 de `/development-plan` |
+| Integración | Contratos entre servicios, Kafka, saga, WireMock | Desarrolladores | Etapa 5 de `/development-plan` |
+| Aceptación (ATDD/BDD) | Criterios AC-xxx del SDD materializados en Cucumber | QA | `/testing-plan` |
+| E2E | Flujos completos de usuario con Playwright y REST Assured | QA | `/testing-plan` |
+| Carga y Estrés | k6 contra los servicios críticos en K3s VPS | QA / Performance | `/testing-plan` |
+
 ### Notas
 
 - **TDD obligatorio y transversal**: ningún componente se implementa sin una prueba previa (Red-Green-Refactor). Backend: JUnit 5 + StepVerifier + Testcontainers + WebTestClient. Frontend: Vitest + RTL + MSW + Playwright.
@@ -405,6 +421,69 @@ Todos los documentos generados apuntan al ambiente K3s del VPS:
 - La autenticación usa **Keycloak** (OAuth2/OIDC); el frontend apunta a `KEYCLOAK_URL` y las APIs se exponen vía **Kong Gateway**.
 - Los Helm charts de cada servicio se gestionan en el repo `<org>-helm-charts` en Gitea; ArgoCD los auto-descubre con un Git generator.
 - Entornos: `local` (VM QEMU/KVM) y `prod` (Oracle Cloud OCI); sin EKS, sin floci, sin AWS Cognito.
+
+---
+
+## Paso 8 — Etapa SDLC: Testing QA
+
+**Skill:** `/testing-plan`  
+**Entrada:** Strategic Design (`docs/strategic-design/`) + Development Plan (`docs/development/`)  
+**Salida:** cuatro documentos en `docs/testing/`
+
+### Instrucciones
+
+Sin argumentos (lee automáticamente desde `docs/strategic-design/` y `docs/development/`):
+
+```
+/testing-plan
+```
+
+Con rutas explícitas:
+
+```
+/testing-plan docs/strategic-design/
+/testing-plan docs/strategic-design/ docs/development/
+```
+
+### Qué genera
+
+| Documento | Descripción |
+|-----------|-------------|
+| `QA-<proyecto>-plan.md` | Plan maestro: pirámide de pruebas, herramientas, stages Jenkins (`runAcceptanceTests`, `runE2ETests`, `runPerformanceTests`), tabla de trazabilidad AC-xxx → test, Definición de Done QA |
+| `QA-<proyecto>-acceptance.md` | Pruebas de aceptación ATDD/BDD: materializa los criterios AC-xxx y escenarios Gherkin del `/strategic-design-sdd` en suites Cucumber (Java + REST Assured para API, Playwright para UI) |
+| `QA-<proyecto>-e2e.md` | Pruebas E2E: flujos de usuario completos con Playwright (Page Object Model) y REST Assured contra Kong proxy; incluye checklist de verificación de observabilidad E2E (Grafana Tempo, Prometheus, Loki) |
+| `QA-<proyecto>-performance.md` | Pruebas de rendimiento: carga sostenida y estrés con k6; scripts concretos por servicio, thresholds derivados de los SLAs del SDD, correlación con Grafana/Prometheus, gate manual en Jenkins |
+
+### Fuentes del plan de pruebas
+
+| Artefacto fuente | Qué aporta al plan QA |
+|---|---|
+| `SDD-<proyecto>-domain.md §9` | Criterios de aceptación AC-xxx (éxito y error) → `acceptance.md` |
+| `SDD-<proyecto>-domain.md §10` | Escenarios BDD Gherkin → archivos `.feature` en `qa/acceptance/` |
+| `SDD-<proyecto>-domain.md §8` | Workflows de negocio → flujos E2E Playwright en `qa/e2e/` |
+| `SDD-<proyecto>-architecture.md §1` | SLAs y atributos de calidad → thresholds k6 en `qa/performance/` |
+| `SDD-<proyecto>-security.md §1` | Tabla de roles → usuarios de prueba en Keycloak |
+| `DEV-<proyecto>-roadmap.md` | Mapa de microservicios y puertos → servicios candidatos a pruebas de rendimiento |
+| `DEV-<proyecto>-00-infrastructure.md` | VPS_IP y endpoints concretos → `BASE_URL`, `KEYCLOAK_URL`, `GRAFANA_URL` |
+
+### Herramientas QA integradas
+
+| Tipo | Herramienta | Integración |
+|---|---|---|
+| Aceptación / BDD | Cucumber 7 (Java) + REST Assured 5 | Stage `runAcceptanceTests` en Jenkins Shared Library |
+| Aceptación UI | `@cucumber/cucumber` + Playwright | Stage `runAcceptanceTests` en Jenkins Shared Library |
+| E2E Frontend | Playwright (TypeScript) + Page Object Model | Stage `runE2ETests` en Jenkins (paralelo con API) |
+| E2E Backend | REST Assured (Java) | Stage `runE2ETests` en Jenkins (paralelo con Playwright) |
+| Mocking externos | WireMock (pod K3s, namespace `infra`) | Usado en aceptación y E2E; no mocks en memoria |
+| Carga y Estrés | k6 + Prometheus Remote Write | Stage `runPerformanceTests` (manual gate en Jenkins) |
+| Observabilidad E2E | Grafana Tempo + Prometheus + Loki | Checklist post-E2E; resultados k6 visibles en Grafana |
+
+### Notas
+
+- Los criterios ATDD (AC-xxx) y los escenarios BDD se extraen **exactamente** del `/strategic-design-sdd` — no se inventan criterios nuevos en esta etapa.
+- Las pruebas de rendimiento apuntan siempre a **Kong proxy** (`VPS_IP:8000`), nunca directamente a los puertos de los microservicios.
+- El stage `runPerformanceTests` usa un `input` step en Jenkins (aprobación manual) para evitar interferir con otros pipelines que usen el mismo ambiente K3s.
+- Las pruebas de estrés se ejecutan **solo en el ambiente local** (K3s VPS QEMU/KVM). Nunca contra producción sin autorización.
 
 ---
 
@@ -432,16 +511,21 @@ sdlc-framework-saas/
 │   │   └── database/
 │   │       ├── SDD-<proyecto>-schema.sql
 │   │       └── SDD-<proyecto>-collections.js
-│   └── development/                # Paso 7: planes generados por /development-plan
-│       ├── DEV-<proyecto>-roadmap.md
-│       ├── DEV-<proyecto>-00-infrastructure.md
-│       ├── DEV-<proyecto>-0c-observability.md
-│       ├── DEV-<proyecto>-01-databases.md
-│       ├── DEV-<proyecto>-02-scaffold.md
-│       ├── DEV-<proyecto>-02b-cicd.md
-│       ├── DEV-<proyecto>-03-ms-<servicio>.md
-│       ├── DEV-<proyecto>-04-fe-<feature>.md
-│       └── DEV-<proyecto>-05-tests.md
+│   ├── development/                # Paso 7: planes generados por /development-plan
+│   │   ├── DEV-<proyecto>-roadmap.md
+│   │   ├── DEV-<proyecto>-00-infrastructure.md
+│   │   ├── DEV-<proyecto>-0c-observability.md
+│   │   ├── DEV-<proyecto>-01-databases.md
+│   │   ├── DEV-<proyecto>-02-scaffold.md
+│   │   ├── DEV-<proyecto>-02b-cicd.md
+│   │   ├── DEV-<proyecto>-03-ms-<servicio>.md
+│   │   ├── DEV-<proyecto>-04-fe-<feature>.md
+│   │   └── DEV-<proyecto>-05-tests.md
+│   └── testing/                    # Paso 8: plan QA generado por /testing-plan
+│       ├── QA-<proyecto>-plan.md
+│       ├── QA-<proyecto>-acceptance.md
+│       ├── QA-<proyecto>-e2e.md
+│       └── QA-<proyecto>-performance.md
 └── .claude/
     ├── formatos/
     │   ├── input-template.md           # Plantilla de captura del requerimiento (Paso 1)
@@ -467,6 +551,7 @@ sdlc-framework-saas/
         ├── strategic-design-sdd/       # Skill de diseño estratégico
         ├── technical-design-sdd/       # Skill de diseño técnico
         ├── development-plan/           # Skill de plan de implementación
+        ├── testing-plan/               # Skill de plan de pruebas QA
         └── observability-plan/         # Skill de plan de observabilidad
 ```
 
@@ -483,6 +568,6 @@ sdlc-framework-saas/
 | 5 | Diseño Estratégico | `/strategic-design-sdd` | `docs/strategic-design/SDD-<proyecto>-*.md` (×3) | Disponible |
 | 6 | Diseño Técnico del Sistema | `/technical-design-sdd` | `docs/design/SDD-<proyecto>-*.md` (×3) + artefactos | Disponible |
 | 7 | Implementación | `/development-plan` | `docs/development/DEV-<proyecto>-*.md` (roadmap + etapas) | Disponible |
-| 8 | Pruebas | — | — | Próximamente |
+| 8 | Testing QA | `/testing-plan` | `docs/testing/QA-<proyecto>-*.md` (×4) | Disponible |
 | 9 | Despliegue | — | — | Próximamente |
 | 10 | Mantenimiento | — | — | Próximamente |

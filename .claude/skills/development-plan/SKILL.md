@@ -34,7 +34,7 @@ docs/development/
 ├── DEV-[proyecto]-02b-cicd.md            # Etapa 2b: Configuración del pipeline CI/CD (Jenkins + ArgoCD)
 ├── DEV-[proyecto]-03-ms-[servicio].md    # Etapa 3: Un archivo por microservicio
 ├── DEV-[proyecto]-04-fe-[feature].md     # Etapa 4: Un archivo por feature frontend
-└── DEV-[proyecto]-05-tests.md            # Etapa 5: Pruebas de integración, E2E, estrés y carga
+└── DEV-[proyecto]-05-tests.md            # Etapa 5: Pruebas de integración (contrato, saga, WireMock)
 ```
 
 Los archivos de microservicio (`03-ms-`) se generan uno por cada bounded context identificado en el diseño. Los archivos de feature frontend (`04-fe-`) se generan según la segmentación de features derivada del diseño. El orden numérico define la secuencia de ejecución.
@@ -574,53 +574,34 @@ Ajustar esta segmentación según lo que indiquen los bounded contexts y el dise
 
 ## Etapa 5 — DEV-[proyecto]-05-tests.md
 
-Título H1: `# Etapa 5 — Pruebas de Integración, E2E, Estrés y Carga`
+Título H1: `# Etapa 5 — Pruebas de Integración`
+
+**Alcance de esta etapa:** pruebas de integración entre microservicios, Kafka, saga y sistemas externos simulados con WireMock. Son responsabilidad del equipo de **desarrollo** y se ejecutan con el pipeline CI/CD durante la implementación. Las pruebas de aceptación (ATDD/BDD), E2E, carga, estrés y observabilidad E2E son responsabilidad del equipo de **QA** y están documentadas en `docs/testing/` (skill `/testing-plan`).
 
 Secciones en orden exacto:
 
-1. **Objetivo** — describir la cobertura de pruebas de esta etapa y qué riesgos mitiga.
-2. **Prerrequisitos** — todos los microservicios y el frontend deben estar corriendo como pods en el cluster K3s local.
+1. **Objetivo** — verificar que los microservicios interactúan correctamente entre sí y con la infraestructura (Kafka, PostgreSQL, MongoDB, sistemas externos via WireMock) una vez todos los componentes están implementados. Estas pruebas complementan las pruebas unitarias por capa ya ejecutadas en las Etapas 3 y 4.
+2. **Prerrequisitos** — todos los microservicios desplegados como pods en el cluster K3s local; `kubectl get pods -A` muestra todos en `Running`; Kafka, PostgreSQL y MongoDB accesibles; WireMock corriendo en namespace `infra`.
 3. **Pruebas de Integración**
-   - Estrategia: contrato entre microservicios (Spring Cloud Contract o pruebas de API directas)
-   - Tabla de escenarios de integración: servicio productor → servicio consumidor → flujo a verificar
-   - Herramienta: Testcontainers + JUnit 5 (backend), ambiente local completo
-   - Flujos críticos de integración: autenticación → originación → ciclo de vida, eventos Kafka entre servicios
-   - **Contract tests de sistemas externos (si hay `integration-service`):** validar las rutas Camel de `integration-service` contra los sistemas externos simulados con **WireMock** (respuestas válidas, errores y timeouts para ejercitar el circuit breaker Resilience4j). Tabla: sistema externo → ruta Camel → escenario (éxito/error/timeout) → resultado esperado.
-   - **Saga (si hay orquestación):** verificar la saga completa (happy path) coordinada por `integration-service` y la **saga compensada** provocando el fallo de un participante, comprobando que se ejecutan las compensaciones de los pasos previos en orden inverso y que las compensaciones son idempotentes (reentrega no duplica efecto). Verificar también la publicación de eventos vía outbox (no dual-write).
-4. **Pruebas E2E**
-   - Herramienta: Playwright (frontend) + Supertest/REST Assured (backend directo)
-   - Tabla de flujos E2E: nombre, descripción, actores, precondiciones, pasos, resultado esperado
-   - Flujos mínimos obligatorios:
-     - Registro y autenticación de usuario
-     - Solicitud de crédito completa (cliente → evaluación → aprobación)
-     - Registro de pago
-     - Generación de reporte de cartera
-5. **Pruebas de Estrés**
-   - Herramienta: k6
-   - Escenarios: ramp-up hasta punto de quiebre por servicio crítico
-   - Servicios a estresar: originacion-service, clientes-service, ciclovida-service
-   - Métricas a capturar: latencia P95/P99, tasa de error, throughput
-6. **Pruebas de Carga**
-   - Herramienta: k6
-   - Escenarios: carga sostenida representativa del uso normal
-   - Tabla: escenario → VUs → duración → umbral de aceptación (P95 < X ms, error rate < Y%)
-7. **Verificación E2E de Observabilidad**
-   - Verificar que el stack de observabilidad instalado en Etapa 0c está integrado correctamente con los microservicios desplegados:
-   - Tabla de escenarios de observabilidad E2E:
+   - Estrategia: contrato entre microservicios (Spring Cloud Contract o pruebas de API directas vía Kong proxy)
+   - Tabla de escenarios de integración: servicio productor → servicio consumidor → flujo a verificar → herramienta
+   - Herramienta: Testcontainers + JUnit 5 para adaptadores contra infraestructura real; WebTestClient para contratos HTTP entre servicios
+   - Flujos críticos de integración: autenticación (Keycloak) → servicios de dominio via Kong, eventos Kafka entre bounded contexts
+   - **Contract tests de sistemas externos (si hay `integration-service`):** validar las rutas Camel de `integration-service` contra los sistemas externos simulados con **WireMock** (respuestas válidas, errores HTTP y timeouts para ejercitar el circuit breaker Resilience4j). Tabla: sistema externo → ruta Camel → escenario (éxito/error/timeout) → resultado esperado.
+   - **Saga (si hay orquestación):** verificar la saga completa (happy path) coordinada por `integration-service` y la **saga compensada** provocando el fallo de un participante, comprobando que se ejecutan las compensaciones en orden inverso y que las compensaciones son idempotentes (reentrega no produce doble efecto). Verificar también la publicación de eventos vía outbox (no dual-write).
+4. **Configuración del Ambiente de Pruebas de Integración**
+   - Variables de entorno específicas: `BASE_URL` (Kong proxy `http://VPS_IP:8000`), credenciales Keycloak QA, prefijos de BD
+   - Comandos para verificar el estado del ambiente antes de ejecutar: `kubectl get pods -A --kubeconfig ~/.kube/config-<proyecto>-local`
+   - Seeders de datos de prueba requeridos (fixtures por bounded context)
+5. **Criterios de Aceptación** — lista de verificación final de la etapa de desarrollo:
+   - [ ] Todos los escenarios de integración entre servicios finalizan en verde.
+   - [ ] Los contract tests de sistemas externos (WireMock) cubren éxito, error HTTP y timeout por ruta Camel.
+   - [ ] La saga happy path completa sin errores; la saga compensada revierte en orden inverso.
+   - [ ] Las compensaciones de saga son idempotentes (reentrega verificada).
+   - [ ] Los eventos de dominio se publican vía outbox (no dual-write — verificado con Testcontainers).
+   - [ ] El pipeline CI/CD (`runIntegrationTests` en Jenkins) finaliza en verde para todos los servicios.
 
-     | Escenario | Herramienta | Precondición | Resultado esperado |
-     |---|---|---|---|
-     | Traza end-to-end generada | Grafana Explore (datasource Tempo, `http://VPS_IP:3001`) | Request HTTP al endpoint de un microservicio | Traza visible con spans de todos los servicios involucrados; `traceId` correlacionado |
-     | Métrica scrapeada | Prometheus (`http://VPS_IP:9090`) | Microservicio en `Running` | `http_server_requests_seconds_count` con la etiqueta `application=<servicio>` aparece en Prometheus |
-     | Log estructurado con traceId | Grafana Loki (`http://VPS_IP:3001`) | Request HTTP generada | Log en JSON con `traceId` y `spanId` coincidentes con la traza en Tempo |
-     | Prometheus scrapea todos los servicios | Prometheus Status > Targets | Todos los microservicios en `Running` | Todos los targets en estado `UP`; ninguno en `DOWN` |
-
-   - Indicar que en prod la verificación es equivalente: mismos endpoints (Grafana Tempo, Prometheus, Loki) en el K3s del VPS Oracle Cloud OCI.
-8. **Configuración del Ambiente de Pruebas**
-   - Variables de entorno específicas para el ambiente de test
-   - Comandos para levantar todos los servicios en modo test (K3s local con pods en `Running`)
-   - Seeders de datos de prueba requeridos
-9. **Criterios de Aceptación** — lista de verificación final de la etapa de desarrollo. Incluir criterios de observabilidad: traza E2E visible en Grafana Tempo, métrica en Prometheus, log JSON con `traceId` en Grafana Loki.
+> **Pruebas QA (siguiente etapa):** las pruebas de aceptación ATDD/BDD (Cucumber), E2E (Playwright + REST Assured), carga y estrés (k6) y verificación de observabilidad E2E se documentan en `docs/testing/` y son ejecutadas por el equipo de QA usando la skill `/testing-plan`.
 
 ---
 
