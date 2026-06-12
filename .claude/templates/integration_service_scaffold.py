@@ -64,9 +64,9 @@ def get_integration_root_pom(project_name: str, safe_name: str, modules: list[st
     <dependencyManagement>
         <dependencies>
             <dependency>
-                <groupId>io.awspring.cloud</groupId>
-                <artifactId>spring-cloud-aws-dependencies</artifactId>
-                <version>3.2.1</version>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>2024.0.0</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -80,10 +80,6 @@ def get_integration_root_pom(project_name: str, safe_name: str, modules: list[st
         </dependencies>
     </dependencyManagement>
     <dependencies>
-        <dependency>
-            <groupId>io.awspring.cloud</groupId>
-            <artifactId>spring-cloud-aws-starter-secrets-manager</artifactId>
-        </dependency>
         <dependency>
             <groupId>io.projectreactor</groupId>
             <artifactId>reactor-core</artifactId>
@@ -233,8 +229,14 @@ def get_integration_app_pom(parent_artifact_id: str, safe: str, modules: list[st
             <artifactId>{artifact}</artifactId>
             <version>${{project.version}}</version>
         </dependency>""")
+    vault_dep = """\
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-vault-config</artifactId>
+        </dependency>
+"""
     deps = "\n".join(dep_blocks) + "\n"
-    return _module_pom_header(parent_artifact_id, safe, "infrastructure/entry-points/app") + deps + """\
+    return _module_pom_header(parent_artifact_id, safe, "infrastructure/entry-points/app") + deps + vault_dep + """\
     </dependencies>
     <build>
         <plugins>
@@ -261,11 +263,11 @@ def get_integration_yaml(project_name: str, port: int, org: str, externals: list
         "  application:",
         f"    name: {project_name}",
         "  config:",
-        f'    import: "aws-secretsmanager:/{org}/${{APP_ENV:dev}}/{project_name}"',
+        f'    import: "optional:vault://{org}/${{APP_ENV:dev}}/{project_name}"',
         "  cloud:",
-        "    aws:",
-        "      region:",
-        "        static: us-east-1",
+        "    vault:",
+        "      uri: ${VAULT_ADDR:http://vault.secrets.svc.cluster.local:8200}",
+        "      token: ${VAULT_TOKEN}",
         "  r2dbc:",
         "    url: ${R2DBC_URL}",
         "    username: ${DB_USERNAME}",
@@ -295,37 +297,53 @@ def get_integration_yaml(project_name: str, port: int, org: str, externals: list
 
 
 def get_integration_secrets_script(project_name: str, port: int, org: str, externals: list[str]) -> str:
-    import json
-    secret = {
-        "SERVER_PORT": str(port),
-        "R2DBC_URL": "r2dbc:postgresql://${VPS_IP:-localhost}:5432/mydb",
-        "DB_USERNAME": "postgres",
-        "DB_PASSWORD": "change_me",
-        "KAFKA_BOOTSTRAP_SERVERS": "${VPS_IP:-localhost}:29092",
-        "KAFKA_CONSUMER_GROUP_ID": f"{project_name}-group",
-        "LRA_COORDINATOR_URL": "http://${VPS_IP:-localhost}:50000/lra-coordinator",
-    }
+    svc_slug = project_name.replace("-", "_")
+    pg_db = f"{org}_{svc_slug}"
+
+    kvpairs = [
+        f"SERVER_PORT={port}",
+        f"R2DBC_URL=r2dbc:postgresql://postgresql.data.svc.cluster.local:5432/{pg_db}",
+        f"DB_USERNAME={pg_db}_user",
+        f"DB_PASSWORD=changeme_{svc_slug}",
+        "KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.messaging.svc.cluster.local:9092",
+        f"KAFKA_CONSUMER_GROUP_ID={project_name}-group",
+        "LRA_COORDINATOR_URL=http://lra-coordinator.infra.svc.cluster.local:8080/lra-coordinator",
+        f"KEYCLOAK_URL=http://keycloak.identity.svc.cluster.local:8080",
+        f"KEYCLOAK_REALM={org}",
+        f"KEYCLOAK_CLIENT_ID={project_name}",
+        f"KEYCLOAK_CLIENT_SECRET=changeme_{svc_slug}_client",
+        f"KEYCLOAK_JWKS_URI=http://keycloak.identity.svc.cluster.local:8080/realms/{org}/protocol/openid-connect/certs",
+        "VAULT_ADDR=http://vault.secrets.svc.cluster.local:8200",
+        f"VAULT_BASE_PATH=secret/{org}/dev",
+    ]
     for name in externals:
-        secret[f"EXT_{name.upper().replace('-', '_')}_BASE_URL"] = f"http://${{VPS_IP:-localhost}}:9999/{name}"
-    secret_json = json.dumps(secret)
+        env_key = f"EXT_{name.upper().replace('-', '_')}_BASE_URL"
+        kvpairs.append(f"{env_key}=http://wiremock.infra.svc.cluster.local:9999/{name}")
+
+    kvpairs_str = " ".join(f'"{kv}"' for kv in kvpairs)
+
     return f"""\
 #!/usr/bin/env bash
-# Crea (o actualiza) el secret de desarrollo del integration-service en floci (VPS).
-# Uso: VPS_IP=192.168.122.50 bash create-secrets-dev.sh
-SECRET_NAME="{org}/dev/{project_name}"
-ENDPOINT="${{FLOCI_ENDPOINT:-http://localhost:4566}}"
-REGION="us-east-1"
+# Crea/actualiza el secret de desarrollo en HashiCorp Vault (K3s).
+# Uso: KUBECONFIG=~/.kube/config-{org}-local bash scripts/create-secrets-dev.sh
+# Requiere que Vault esté unsealed y vault-init.json esté disponible.
 
-if aws --endpoint-url="$ENDPOINT" secretsmanager describe-secret \\
-       --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
-    aws --endpoint-url="$ENDPOINT" secretsmanager put-secret-value \\
-        --secret-id "$SECRET_NAME" --secret-string '{secret_json}' --region "$REGION"
-    echo "Secret actualizado: $SECRET_NAME"
-else
-    aws --endpoint-url="$ENDPOINT" secretsmanager create-secret \\
-        --name "$SECRET_NAME" --secret-string '{secret_json}' --region "$REGION"
-    echo "Secret creado: $SECRET_NAME"
+set -euo pipefail
+KUBECONFIG="${{KUBECONFIG:-$HOME/.kube/config-{org}-local}}"
+SECRET_PATH="{org}/dev/{project_name}"
+INIT_FILE="${{VAULT_INIT_FILE:-./vault-init.json}}"
+
+if [[ -f "$INIT_FILE" ]]; then
+    VAULT_TOKEN=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['root_token'])" 2>/dev/null \\
+        || jq -r '.root_token' "$INIT_FILE" 2>/dev/null)
 fi
+VAULT_TOKEN="${{VAULT_TOKEN:-${{VAULT_ROOT_TOKEN:-}}}}"
+[[ -z "$VAULT_TOKEN" ]] && {{ echo "ERROR: VAULT_TOKEN no disponible"; exit 1; }}
+
+kubectl --kubeconfig="$KUBECONFIG" exec -n secrets vault-0 -- \\
+    sh -c "VAULT_TOKEN=${{VAULT_TOKEN}} vault kv put secret/${{SECRET_PATH}} {kvpairs_str}"
+
+echo "Secret creado/actualizado: secret/${{SECRET_PATH}}"
 """
 
 
