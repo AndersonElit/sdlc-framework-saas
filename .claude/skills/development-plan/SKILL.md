@@ -41,7 +41,7 @@ Los archivos de microservicio (`03-ms-`) se generan uno por cada bounded context
 
 Si el diseño técnico definió una **capa de integración dedicada** (Apache Camel) y/o **orquestación de saga**, se genera además un documento `DEV-[proyecto]-03-ms-integration-service.md` para el `integration-service` (capa de integración + orquestador de saga). Por su rol, este servicio se implementa en el orden que indique el roadmap respecto de los flujos de saga: sus sistemas externos no dependen de otros microservicios, pero la saga necesita que los participantes expongan sus compensaciones, por lo que el orquestador suele implementarse después de los participantes que coordina (o en paralelo, validando con dobles de prueba).
 
-Si el diseño técnico definió un **subsistema de reportería**, se generan además `DEV-[proyecto]-03-ms-report-extraction-service.md` (MS1, Spark) y `DEV-[proyecto]-03-ms-report-processing-service.md` (MS2, Spark), y un documento `DEV-[proyecto]-06-reporting-serverless.md` para la capa serverless de formatos (lambdas PDF/XLS/CSV + EventBridge). Estos servicios son *jobs batch* Spark (no servicios REST); ver "Reglas para los documentos de reportería" en la Etapa 3.
+Si el diseño técnico definió un **subsistema de reportería**, se generan además `DEV-[proyecto]-03-ms-report-extraction-service.md` (MS1, Spark) y `DEV-[proyecto]-03-ms-report-processing-service.md` (MS2, Spark), y un documento `DEV-[proyecto]-06-reporting-serverless.md` para la capa serverless de formatos (OpenFaaS functions via Helm en K3s — CSV/XLS). Estos servicios son *jobs batch* Spark (no servicios REST); ver "Reglas para los documentos de reportería" en la Etapa 3.
 
 # ESTILO DE LOS DOCUMENTOS
 
@@ -307,7 +307,7 @@ Secciones en orden exacto:
    - Si el diseño definió **subsistema de reportería con CQRS**, incluir además:
      - `--backend reporting-projection-service:postgres:kafka-consumer:<puerto>` (Projection Service, Spring Boot reactivo; Kafka consumer + R2DBC PostgreSQL; generado con `maven_hexagonal_scaffold.py`; conecta a `<pg-prefix>_readmodel` — `create-all-secrets-vault.sh` lo detecta por el patrón `*projection*` y le asigna esa BD). Es el **único escritor** del read model PostgreSQL.
      - `--report-extraction <svc>:jdbc:<topic-out>` (**ETL unificado**, Spark; `--source jdbc` lee el read model PostgreSQL `<pg-prefix>_readmodel` vía `SparkJdbcSourceAdapter`; hace extracción + validación de esquema + transformación (Factory DR-10) en un solo job CronJob; publica `ReportParquetGenerated`; recibe `--pg-db <pg-prefix>` para derivar `<prefix>_readmodel` y `<prefix>_reporting`; `--report-types <lista>` registra un `ReportTransformer` por tipo en la Factory).
-     - `--report-formats pdf,xls,csv` (capa serverless: Lambda/OCI-Function Kafka Consumer que lee `ReportParquetGenerated` y genera el archivo final; generada con `report_lambdas_scaffold.py`).
+     - `--report-formats pdf,xls,csv` (capa serverless: OpenFaaS Function Kafka Consumer que lee `ReportParquetGenerated` y genera el archivo final; desplegada con Helm en K3s, generada con `report_lambdas_scaffold.py`).
      - El ETL unificado se genera con `scala_hexagonal_scaffold.py` (no Maven); compila/ensambla con sbt. El Projection Service se genera con Maven scaffold. **No hay un segundo MS Spark separado** para procesamiento.
    - Tabla resumen: servicio → puerto local → DB → mensajería → módulos generados.
    - Indicar si el servicio usa mensajería (kafka-producer / kafka-consumer / ambos / none).
@@ -499,14 +499,14 @@ Si el diseño técnico declara reportería, generar documentos dedicados (no usa
 - **Despliegue K8s:** `helm/<service>/templates/cronjob.yaml` (CronJob, no Deployment); ArgoCD sincroniza el CronJob; Jenkins **no ejecuta smoke tests** (sin endpoint HTTP). El CI termina en `bumpImageTag`.
 - **Criterios de aceptación:** `sbt compile` y `sbt assembly` verdes; validación fallida ⇒ `report.etl.failed` sin parquet; lectura del read model exitosa vía JDBC; `ReportParquetGenerated` publicado (un evento por formato).
 
-**`DEV-[proyecto]-06-reporting-serverless.md` (capa de formatos)** — lambdas + EventBridge:
-- **Scaffolding:** `.claude/templates/report_lambdas_scaffold.py --org <proyecto> --formats pdf,xls,csv` (vía `--report-formats`). Genera Lambda Kafka Consumer, lambdas PDF/XLS/CSV y el Terraform de EventBridge (bus + una rule por formato).
-- **TDD:** cada función de formato (parquet→archivo válido en `output/` con pytest + MinIO del K3s), Consumer Kafka (evento `ReportParquetGenerated` → genera archivo en MinIO), enrutamiento por campo `format` del evento.
-- **Despliegue:** OCI Functions en prod / servicio K3s en local; `ENABLE_REPORTING_SERVERLESS` para omitir.
+**`DEV-[proyecto]-06-reporting-serverless.md` (capa de formatos)** — OpenFaaS via Helm en K3s:
+- **Scaffolding:** `.claude/templates/report_lambdas_scaffold.py --org <proyecto> --kafka-topic report.processed --image-registry <registry>` (vía `--report-formats`). Genera: función OpenFaaS `report-format-consumer` (python3-http), `stack.yml` faas-cli, Helm values para `openfaas/openfaas` y `openfaas/kafka-connector`, script de secrets K8s y `deploy.sh`.
+- **TDD:** función de formato (parquet→archivo válido en `output/` con pytest + MinIO del K3s), handler OpenFaaS (evento `ReportParquetGenerated` → genera archivo en MinIO), enrutamiento por campo `format` del evento (anotación `topic:` en stack.yml).
+- **Despliegue:** `helm upgrade --install openfaas openfaas/openfaas` + `helm upgrade --install kafka-connector openfaas/kafka-connector` en namespace `openfaas` del K3s; función desplegada con `faas-cli deploy`; `ENABLE_REPORTING_SERVERLESS` para omitir.
 
 **En el Documento Maestro (roadmap):** añadir al **Mapa de Microservicios** las columnas **"Tipo de reporte"** y **"Formatos"** para los servicios de reportería; MS1/MS2 son *jobs batch* (no servicios REST), con dependencia MS1→MS2 vía `report.extracted` y MS2→serverless vía `report.processed`.
 
-**En `DEV-[proyecto]-05-tests.md`:** añadir el **E2E de reportería**: (a) camino feliz — ETL unificado lee fuente → valida → transforma → parquet en MinIO → publica `ReportParquetGenerated` → Lambda/OCI-Function genera 3 formatos en `output/`; (b) validación fallida (columna faltante ⇒ `report.etl.failed`, sin parquet ni evento). Ejecutado con MinIO + Kafka (K3s del VPS) + OCI Functions local.
+**En `DEV-[proyecto]-05-tests.md`:** añadir el **E2E de reportería**: (a) camino feliz — ETL unificado lee fuente → valida → transforma → parquet en MinIO → publica `ReportParquetGenerated` → OpenFaaS Function genera 3 formatos en `output/`; (b) validación fallida (columna faltante ⇒ `report.etl.failed`, sin parquet ni evento). Ejecutado con MinIO + Kafka (K3s del VPS) + OpenFaaS desplegado via Helm en K3s.
 
 ---
 

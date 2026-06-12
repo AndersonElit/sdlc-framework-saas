@@ -141,6 +141,7 @@ generate_terraform() {
     "$TF_ROOT/modules/helm-observability" \
     "$TF_ROOT/modules/helm-support" \
     "$TF_ROOT/modules/helm-gateway" \
+    "$TF_ROOT/modules/helm-serverless" \
     "$TF_ROOT/environments"
 
   # ── providers.tf ────────────────────────────────────────────────────────────
@@ -196,6 +197,8 @@ variable "install_kong"             { type = bool; default = true }
 variable "keycloak_realm"           { type = string; default = "" }
 variable "minio_root_password"       { type = string; sensitive = true; default = "changeme_minio" }
 variable "install_minio"             { type = bool; default = true }
+variable "install_openfaas"          { type = bool; default = false }
+variable "openfaas_basic_auth_password" { type = string; sensitive = true; default = "changeme_openfaas" }
 TFEOF
 
   # ── main.tf ──────────────────────────────────────────────────────────────────
@@ -270,6 +273,14 @@ module "helm_gateway" {
   kubeconfig_path = var.kubeconfig_path
   keycloak_realm  = var.keycloak_realm != "" ? var.keycloak_realm : var.project
 }
+
+# ── Serverless: OpenFaaS gateway (opcional; Kafka Connector se despliega por proyecto) ──
+module "helm_serverless" {
+  source                       = "./modules/helm-serverless"
+  depends_on                   = [module.namespaces]
+  install_openfaas             = var.install_openfaas
+  openfaas_basic_auth_password = var.openfaas_basic_auth_password
+}
 TFEOF
 
   # ── outputs.tf ───────────────────────────────────────────────────────────────
@@ -288,7 +299,8 @@ output "otel_grpc"       { value = var.install_tempo ? "tempo.observability.svc.
 output "kong_proxy_url"  { value = var.install_kong ? "http://${var.vm_ip}:8000" : "disabled" }
 output "kong_admin_url"    { value = var.install_kong  ? "kong-kong-admin.gateway.svc.cluster.local:8001 (ClusterIP)" : "disabled" }
 output "minio_api_url"     { value = var.install_minio ? "http://${var.vm_ip}:9000" : "disabled" }
-output "minio_console_url" { value = var.install_minio ? "http://${var.vm_ip}:9001" : "disabled" }
+output "minio_console_url"    { value = var.install_minio    ? "http://${var.vm_ip}:9001"  : "disabled" }
+output "openfaas_gateway_url" { value = var.install_openfaas ? "http://${var.vm_ip}:31112" : "disabled" }
 TFEOF
 
   # ── environments/local.tfvars ─────────────────────────────────────────────
@@ -307,6 +319,8 @@ jenkins_admin_password  = "changeme_jenkins_admin"
 grafana_admin_password  = "changeme_grafana_admin"
 minio_root_password     = "changeme_minio"
 install_minio           = true
+install_openfaas        = false
+openfaas_basic_auth_password = "changeme_openfaas"
 TFEOF
 
   cat > "$TF_ROOT/environments/prod.tfvars" << 'TFEOF'
@@ -338,7 +352,7 @@ TFEOF
   # ── modules/namespaces/main.tf ────────────────────────────────────────────
   cat > "$TF_ROOT/modules/namespaces/main.tf" << 'TFEOF'
 locals {
-  namespaces = ["infra","identity","secrets","data","messaging","cicd","observability","gateway","apps"]
+  namespaces = ["infra","identity","secrets","data","messaging","cicd","observability","gateway","serverless","serverless-fn","apps"]
 }
 resource "kubernetes_namespace" "ns" {
   for_each = toset(local.namespaces)
@@ -1185,6 +1199,62 @@ resource "null_resource" "kong_keycloak_setup" {
     kong_version   = var.install_kong ? helm_release.kong[0].version : "disabled"
     keycloak_realm = var.keycloak_realm
   }
+}
+TFEOF
+
+  # ── modules/helm-serverless ──────────────────────────────────────────────
+  cat > "$TF_ROOT/modules/helm-serverless/variables.tf" << 'TFEOF'
+variable "install_openfaas"             { type = bool;   default = false }
+variable "openfaas_basic_auth_password" { type = string; sensitive = true; default = "changeme_openfaas" }
+TFEOF
+
+  cat > "$TF_ROOT/modules/helm-serverless/main.tf" << 'TFEOF'
+# Agrega el repo Helm de OpenFaaS (idempotente).
+resource "null_resource" "openfaas_helm_repo" {
+  count = var.install_openfaas ? 1 : 0
+  provisioner "local-exec" {
+    command = "helm repo add openfaas https://openfaas.github.io/faas-netes/ 2>/dev/null || true && helm repo update"
+  }
+  triggers = { always = timestamp() }
+}
+
+# Secret basic-auth para el gateway (pre-creado; generateBasicAuth = false).
+resource "kubernetes_secret" "openfaas_basic_auth" {
+  count = var.install_openfaas ? 1 : 0
+  metadata {
+    name      = "basic-auth"
+    namespace = "serverless"
+  }
+  data = {
+    "basic-auth-user"     = "admin"
+    "basic-auth-password" = var.openfaas_basic_auth_password
+  }
+}
+
+# OpenFaaS gateway + nats + queue-worker + faas-netes operator.
+# El Kafka Connector se despliega por proyecto en terraform/reporting/ (report_lambdas_scaffold.py).
+resource "helm_release" "openfaas" {
+  count      = var.install_openfaas ? 1 : 0
+  depends_on = [null_resource.openfaas_helm_repo, kubernetes_secret.openfaas_basic_auth]
+
+  name       = "openfaas"
+  repository = "https://openfaas.github.io/faas-netes/"
+  chart      = "openfaas"
+  version    = "14.2.24"
+  namespace  = "serverless"
+  wait       = true
+  timeout    = 300
+
+  set { name = "functionNamespace";          value = "serverless-fn" }
+  set { name = "generateBasicAuth";          value = "false" }
+  set { name = "basic_auth";                 value = "true" }
+  set { name = "operator.create";            value = "true" }
+  set { name = "operator.createCRD";         value = "true" }
+  set { name = "gateway.replicas";           value = "1" }
+  set { name = "gateway.service.type";       value = "NodePort" }
+  set { name = "gateway.service.nodePort";   value = "31112" }
+  set { name = "queueWorker.replicas";       value = "1" }
+  set { name = "nats.channel";               value = "from-gateway" }
 }
 TFEOF
 
