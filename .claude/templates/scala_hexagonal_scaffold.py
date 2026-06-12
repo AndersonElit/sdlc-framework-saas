@@ -2,9 +2,10 @@
 """Genera un proyecto base Scala (sbt) multimódulo con arquitectura hexagonal y batch Spark.
 
 Modo genérico (sin --report-role): arquetipo batch vacío (placeholders + BatchMain vacío).
-Modo reportería (--report-role extraction|processing): genera el subsistema ETL Spark
-descrito en PLAN-reporteria-spark-etl.md (§7.1.1), con adaptadores Mongo (read model CQRS) /
-JDBC / S3-parquet / Kafka y el patrón Factory de transformadores (DR-10).
+Modo reportería (--report-role extraction): genera el ETL Spark unificado (report-etl-service)
+que realiza extracción, validación de esquema, transformación vía Factory (DR-10) y publica
+el evento ReportParquetGenerated. La capa de formatos (Lambda/OCI Functions que consume
+ReportParquetGenerated y genera csv/xls) se genera con report_lambdas_scaffold.py.
 """
 
 import argparse
@@ -29,7 +30,6 @@ def build_files(root: Path, svc: str, pkg: str,
 
     reporting = report_role is not None
     extraction_mongo = report_role == "extraction" and source == "mongo"
-    processing = report_role == "processing"
 
     # vals de dependencias extra del modo reportería
     extra_vals = ""
@@ -50,8 +50,8 @@ def build_files(root: Path, svc: str, pkg: str,
         driven_libs += " ++ mongo"
 
     entry_extra = " ++ logging"
-    if processing:
-        entry_extra += " ++ kafka"
+    # El ETL unificado publica eventos vía KafkaEventPublisher (driven-adapter);
+    # la dependencia Kafka llega transitivamente desde drivenAdapters.
 
     write(root, "build.sbt",
           'ThisBuild / organization := "com.example"\n'
@@ -141,6 +141,8 @@ def dotenv_files(root: Path, report_role: str | None = None,
                  source: str = "mongo", pg_db_prefix: str = "", org: str = "myproject") -> None:
     # BD del read model CQRS (PostgreSQL): <prefix>_readmodel si hay prefijo.
     readmodel_db = f"{pg_db_prefix}_readmodel" if pg_db_prefix else "readmodel_db"
+    # BD de reportería propia de MS1: <prefix>_reporting (contiene report_schema_catalog).
+    reporting_db = f"{pg_db_prefix}_reporting" if pg_db_prefix else "reporting"
 
     if report_role is None:
         content = (
@@ -160,16 +162,24 @@ def dotenv_files(root: Path, report_role: str | None = None,
             "# --- Kafka (K3s via Strimzi) ---\n"
             "KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.messaging.svc.cluster.local:9092\n"
         )
+        if report_role == "extraction":
+            content += (
+                "# --- BD de reportería propia de MS1 (<prefix>_reporting) ---\n"
+                "# Contiene report_schema_catalog: catálogo de esquemas para validación.\n"
+                f"REPORTING_JDBC_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{reporting_db}\n"
+                f"REPORTING_JDBC_USER={reporting_db}_user\n"
+                f"REPORTING_JDBC_PASSWORD=changeme_{reporting_db}\n"
+            )
         if report_role == "extraction" and source == "mongo":
             content += (
-                "# --- Read model CQRS (MongoDB en K3s) ---\n"
+                "# --- Read model CQRS (MongoDB en K3s) — SOLO LECTURA ---\n"
                 "MONGO_URI=mongodb://mongodb.data.svc.cluster.local:27017\n"
                 "MONGO_READ_DB=readmodel\n"
                 "MONGO_READ_COLLECTION=ventas\n"
             )
         elif report_role == "extraction" and source == "jdbc":
             content += (
-                "# --- Read model CQRS PostgreSQL (<prefix>_readmodel — NO usar BD operacional) ---\n"
+                "# --- Read model CQRS PostgreSQL (<prefix>_readmodel — SOLO LECTURA, BD del projection-service) ---\n"
                 f"JDBC_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{readmodel_db}\n"
                 "JDBC_TABLE=ventas\n"
                 "JDBC_USER=app\n"
@@ -479,8 +489,10 @@ spec:
 def get_secrets_script_content(svc: str, report_role: str | None,
                                 source: str, org: str = "myproject",
                                 pg_db_prefix: str = "") -> str:
-    # BD PostgreSQL del read model CQRS: <prefix>_readmodel
+    # BD PostgreSQL del read model CQRS: <prefix>_readmodel (propiedad del projection-service, solo lectura)
     readmodel_db = f"{pg_db_prefix}_readmodel" if pg_db_prefix else "readmodel_db"
+    # BD de reportería propia de MS1: <prefix>_reporting (contiene report_schema_catalog)
+    reporting_db = f"{pg_db_prefix}_reporting" if pg_db_prefix else "reporting"
     svc_slug = svc.replace("-", "_")
 
     if report_role is None:
@@ -497,6 +509,13 @@ def get_secrets_script_content(svc: str, report_role: str | None,
             f"REPORT_BUCKET={org}-reports",
             "KAFKA_BOOTSTRAP_SERVERS=kafka-kafka-bootstrap.messaging.svc.cluster.local:9092",
         ]
+        if report_role == "extraction":
+            # BD propia de MS1 (<prefix>_reporting): catálogo de esquemas de validación.
+            kvpairs += [
+                f"REPORTING_JDBC_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{reporting_db}",
+                f"REPORTING_JDBC_USER={reporting_db}_user",
+                f"REPORTING_JDBC_PASSWORD=changeme_{reporting_db.replace('-', '_')}",
+            ]
         if report_role == "extraction" and source == "mongo":
             kvpairs += [
                 "MONGO_URI=mongodb://mongodb.data.svc.cluster.local:27017",
@@ -504,6 +523,7 @@ def get_secrets_script_content(svc: str, report_role: str | None,
                 "MONGO_READ_COLLECTION=ventas",
             ]
         elif report_role == "extraction" and source == "jdbc":
+            # Read model PostgreSQL del projection-service: SOLO LECTURA.
             kvpairs += [
                 f"JDBC_URL=jdbc:postgresql://postgresql.data.svc.cluster.local:5432/{readmodel_db}",
                 "JDBC_TABLE=ventas",
@@ -804,28 +824,18 @@ final case class ReportSchema(
 
     write(root, f"{base}/ReportEvents.scala", _r('''package com.example.__PKG__.domain.model
 
-/** Eventos de dominio del subsistema de reportería (§6). La serialización vive en infraestructura. */
+/** Eventos de dominio del subsistema de reportería. La serialización vive en infraestructura. */
 sealed trait ReportEvent { def reportId: String }
 
-final case class ReportExtracted(
+/** Publicado por report-etl-service tras extraer, validar y transformar el DataFrame.
+ *  Un evento por formato pedido: el Lambda/OCI-Function Consumer genera exactamente ese archivo. */
+final case class ReportParquetGenerated(
     reportId: String,
     runId: String,
     reportType: String,
-    schemaVersion: String,
-    rawParquetUri: String,
-    rowCount: Long,
-    validatedAt: String
-) extends ReportEvent
-
-/** Un evento por formato: report-etl-service publica N mensajes (uno por formato pedido).
- *  El Kafka Consumer lee el campo `format` y genera exactamente ese archivo. */
-final case class ReportProcessed(
-    reportId: String,
-    runId: String,
-    reportType: String,
-    processedParquetUri: String,
+    parquetUri: String,
     format: String,
-    processedAt: String
+    generatedAt: String
 ) extends ReportEvent
 
 final case class ReportFailed(
@@ -873,31 +883,34 @@ trait ParquetStorePort {
 # --------------------------------------------------------------------------- #
 # Use case de extracción (MS1)
 # --------------------------------------------------------------------------- #
-def validate_extract_use_case(root: Path, pkg: str, out_topic: str) -> None:
+def extract_report_use_case(root: Path, pkg: str, out_topic: str) -> None:
+    """Caso de uso unificado: valida esquema, transforma vía Factory y publica ReportParquetGenerated."""
     base = _scala_base(pkg, "usecases")
-    write(root, f"{base}/ValidateAndExtractUseCase.scala", _r('''package com.example.__PKG__.application.usecases
+    write(root, f"{base}/ExtractReportUseCase.scala", _r('''package com.example.__PKG__.application.usecases
 
 import com.example.__PKG__.domain.model._
 import com.example.__PKG__.domain.ports._
 import org.apache.spark.sql.functions.col
 
-/** MS1: valida el DataFrame de origen contra el `ReportSchema` declarado (DR-1),
- *  materializa parquet crudo en `raw/` y publica `report.extracted`.
- *  Si la validación falla ⇒ publica `report.extraction.failed` y falla rápido. */
-class ValidateAndExtractUseCase(
+/** ETL unificado: lee la fuente, valida el ReportSchema (DR-1), transforma vía Factory (DR-10),
+ *  escribe el parquet final y publica ReportParquetGenerated (un evento por formato pedido).
+ *  Si la validación falla publica ReportFailed y lanza excepción. */
+class ExtractReportUseCase(
     source: SourceDataPort,
     store: ParquetStorePort,
+    factory: ReportTransformerFactory,
     events: EventBusPort,
     outTopic: String = "__OUT_TOPIC__"
 ) {
 
-  def execute(schema: ReportSchema, reportId: String, runId: String): Unit = {
+  def execute(schema: ReportSchema, reportType: ReportType,
+              reportId: String, runId: String, formats: List[String]): Unit = {
     val df = source.read()
     val actual = df.columns.toSet
 
     val missing = schema.columnNames.diff(actual)
     if (missing.nonEmpty) {
-      fail(reportId, "extraction", "missing columns", missing.toList)
+      publishFailed(reportId, "extraction", "missing columns", missing.toList)
       throw new IllegalStateException(s"Schema validation failed: missing columns $missing")
     }
 
@@ -905,24 +918,29 @@ class ValidateAndExtractUseCase(
       actual.contains(c) && df.filter(col(c).isNull).limit(1).count() > 0
     }
     if (nullViolations.nonEmpty) {
-      fail(reportId, "extraction", "null values in non-nullable columns", nullViolations)
+      publishFailed(reportId, "extraction", "null values in non-nullable columns", nullViolations)
       throw new IllegalStateException(s"Integrity validation failed: nulls in $nullViolations")
     }
 
-    val uri = store.writeRaw(schema.reportType.value, reportId, df)
-    val rowCount = df.count()
-    val payload =
-      s"""{"reportId":"$reportId","runId":"$runId","reportType":"${schema.reportType.value}",""" +
-      s""""schemaVersion":"${schema.version}","rawParquetUri":"$uri","rowCount":$rowCount,""" +
-      s""""validatedAt":"${java.time.Instant.now()}"}"""
-    events.publish(outTopic, reportId, payload)
+    val transformer = factory.resolve(reportType)
+    val transformed = transformer.transform(df)
+    val uri         = store.writeProcessed(reportType.value, reportId, transformed)
+    val ts          = java.time.Instant.now().toString
+
+    formats.foreach { fmt =>
+      val payload =
+        s"""{"reportId":"$reportId","runId":"$runId","reportType":"${reportType.value}",""" +
+        s""""parquetUri":"$uri","format":"$fmt","generatedAt":"$ts"}"""
+      events.publish(outTopic, s"$reportId-$fmt", payload)
+    }
   }
 
-  private def fail(reportId: String, stage: String, reason: String, cols: List[String]): Unit = {
+  private def publishFailed(reportId: String, stage: String,
+                             reason: String, cols: List[String]): Unit = {
     val arr = cols.map(c => "\\"" + c + "\\"").mkString(",")
     val payload =
       s"""{"reportId":"$reportId","stage":"$stage","reason":"$reason","failedColumns":[$arr]}"""
-    events.publish("report.extraction.failed", reportId, payload)
+    events.publish("report.etl.failed", reportId, payload)
   }
 }
 ''', pkg, OUT_TOPIC=out_topic))
@@ -948,7 +966,7 @@ trait ReportTransformer {
   def transform(raw: DataFrame): DataFrame
 }
 
-/** Se lanza cuando MS2 recibe un `reportType` no registrado en la factory. */
+/** Se lanza cuando el ETL unificado recibe un `reportType` no registrado en la factory. */
 class UnsupportedReportTypeException(rt: ReportType)
     extends RuntimeException(s"Unsupported report type: ${rt.value}")
 ''', pkg))
@@ -965,52 +983,9 @@ class ReportTransformerFactory(registry: Map[ReportType, ReportTransformer]) {
 }
 ''', pkg))
 
-    write(root, f"{base}/ProcessReportUseCase.scala", _r('''package com.example.__PKG__.application.usecases
-
-import com.example.__PKG__.domain.model.ReportType
-import com.example.__PKG__.domain.ports._
-
-/** MS2: resuelve el transformer por `reportType` vía factory, transforma el parquet `raw/`,
- *  materializa `processed/` y publica UN evento por formato en `report.processed`.
- *  El campo `format` (singular) permite que el Kafka Consumer genere exactamente ese archivo. */
-class ProcessReportUseCase(
-    factory: ReportTransformerFactory,
-    store: ParquetStorePort,
-    events: EventBusPort,
-    outTopic: String = "__OUT_TOPIC__"
-) {
-
-  def execute(
-      reportType: ReportType,
-      reportId: String,
-      runId: String,
-      rawUri: String,
-      formats: List[String]
-  ): Unit = {
-    try {
-      val transformer = factory.resolve(reportType)
-      val raw = store.readRaw(rawUri)
-      val processed = transformer.transform(raw)
-      val uri = store.writeProcessed(reportType.value, reportId, processed)
-      val ts  = java.time.Instant.now().toString
-      // Un evento por formato: el Kafka Consumer lee el campo `format` y genera ese archivo.
-      formats.foreach { fmt =>
-        val payload =
-          s"""{"reportId":"$reportId","runId":"$runId","reportType":"${reportType.value}",""" +
-          s""""processedParquetUri":"$uri","format":"$fmt",""" +
-          s""""processedAt":"$ts"}"""
-        events.publish(outTopic, s"$reportId-$fmt", payload)
-      }
-    } catch {
-      case e: UnsupportedReportTypeException =>
-        val payload =
-          s"""{"reportId":"$reportId","stage":"processing","reason":"${e.getMessage}","failedColumns":[]}"""
-        events.publish("report.processing.failed", reportId, payload)
-        throw e
-    }
-  }
-}
-''', pkg, OUT_TOPIC=out_topic))
+    # ProcessReportUseCase eliminado: la transformación via Factory la orquesta
+    # ExtractReportUseCase (ETL unificado). Solo se generan la interfaz, la factory
+    # y los transformers concretos para que el BatchMain los cablee directamente.
 
     for t in types:
         cls = _transformer_class(t)
@@ -1153,84 +1128,18 @@ class KafkaEventPublisher(bootstrapServers: String) extends EventBusPort with Au
 ''', pkg))
 
 
-# --------------------------------------------------------------------------- #
-# Entry point: kafka consumer (MS2)
-# --------------------------------------------------------------------------- #
-def kafka_consumer_entry_point(root: Path, pkg: str, topic_in: str) -> None:
-    base = _scala_base(pkg, "entry")
-    write(root, f"{base}/kafkaconsumer/ReportExtractedConsumer.scala", _r('''package com.example.__PKG__.infrastructure.entrypoints.kafkaconsumer
-
-import com.example.__PKG__.application.usecases.ProcessReportUseCase
-import com.example.__PKG__.domain.model.ReportType
-import org.apache.kafka.clients.consumer.KafkaConsumer
-
-import java.time.Duration
-import java.util.{Collections, Properties, UUID}
-import scala.jdk.CollectionConverters._
-
-/** Entry-point dirigido por evento: consume `__TOPIC_IN__` (report.extracted) y dispara MS2. */
-class ReportExtractedConsumer(
-    bootstrapServers: String,
-    topicIn: String = "__TOPIC_IN__",
-    groupId: String = "report-processing-service",
-    useCase: ProcessReportUseCase
-) {
-
-  @volatile private var running = true
-
-  private def buildConsumer(): KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", bootstrapServers)
-    props.put("group.id", groupId)
-    props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
-    props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "true")
-    new KafkaConsumer[String, String](props)
-  }
-
-  def stop(): Unit = running = false
-
-  def start(): Unit = {
-    val consumer = buildConsumer()
-    consumer.subscribe(Collections.singletonList(topicIn))
-    try {
-      while (running) {
-        val records = consumer.poll(Duration.ofMillis(1000))
-        for (record <- records.asScala) {
-          handle(record.value())
-        }
-      }
-    } finally {
-      consumer.close()
-    }
-  }
-
-  private def handle(json: String): Unit = {
-    val reportType = field(json, "reportType").getOrElse("")
-    val reportId   = field(json, "reportId").getOrElse(UUID.randomUUID().toString)
-    val runId      = field(json, "runId").getOrElse(UUID.randomUUID().toString)
-    val rawUri     = field(json, "rawParquetUri").getOrElse("")
-    // Formatos a generar: un evento por formato → "format" singular en cada mensaje Kafka.
-    val formats = List("XLS", "CSV")  // ajustar si el catálogo define otros formatos
-    useCase.execute(ReportType.fromString(reportType), reportId, runId, rawUri, formats)
-  }
-
-  // Extracción mínima de campos JSON (sustituible por una librería en endurecimiento).
-  private def field(json: String, key: String): Option[String] = {
-    val pattern = ("\\"" + key + "\\"\\\\s*:\\\\s*\\"([^\\"]*)\\"").r
-    pattern.findFirstMatchIn(json).map(_.group(1))
-  }
-}
-''', pkg, TOPIC_IN=topic_in))
+# kafka_consumer_entry_point eliminado: el ETL es un CronJob (no consume eventos Kafka).
+# La capa de formatos (Lambda/OCI-Function que consume ReportParquetGenerated) se genera
+# con report_lambdas_scaffold.py.
 
 
 # --------------------------------------------------------------------------- #
-# BatchMain por rol
+# BatchMain unificado (ETL report-etl-service)
 # --------------------------------------------------------------------------- #
-def report_batch_main(root: Path, svc: str, pkg: str, report_role: str,
-                      source: str, out_topic: str, in_topic: str,
+def report_batch_main(root: Path, svc: str, pkg: str,
+                      source: str, out_topic: str,
                       types: list[str]) -> None:
+    """Genera el BatchMain unificado: leer fuente → validar → transformar → parquet → ReportParquetGenerated."""
     base = _scala_base(pkg, "entry")
 
     spark_builder = _r('''  private def buildSpark(): SparkSession = {
@@ -1238,7 +1147,6 @@ def report_batch_main(root: Path, svc: str, pkg: str, report_role: str,
       .appName("__SVC__")
       .master(sys.env.getOrElse("SPARK_MASTER", "local[*]"))
     // Almacenamiento de objetos S3-compatible: MinIO en dev (K3s), OCI Object Storage en prod.
-    // STORAGE_ENDPOINT vacío → usa AWS S3 real (o provider nativo si OCI SDK configurado).
     val endpoint = sys.env.getOrElse("STORAGE_ENDPOINT", "")
     val spark = builder.getOrCreate()
     val hc = spark.sparkContext.hadoopConfiguration
@@ -1251,18 +1159,17 @@ def report_batch_main(root: Path, svc: str, pkg: str, report_role: str,
   }
 ''', pkg, SVC=svc)
 
-    if report_role == "extraction":
-        if source == "mongo":
-            source_wiring = _r('''      val source = new SparkMongoSourceAdapter(
+    if source == "mongo":
+        source_wiring = _r('''      val source = new SparkMongoSourceAdapter(
         spark,
         sys.env.getOrElse("MONGO_URI", "mongodb://localhost:27017"),
         sys.env.getOrElse("MONGO_READ_DB", "readmodel"),
         sys.env.getOrElse("MONGO_READ_COLLECTION", "ventas")
       )
 ''', pkg)
-            source_import = f"import com.example.{pkg}.infrastructure.driven.mongosource.SparkMongoSourceAdapter"
-        else:
-            source_wiring = _r('''      val source = new SparkJdbcSourceAdapter(
+        source_import = f"import com.example.{pkg}.infrastructure.driven.mongosource.SparkMongoSourceAdapter"
+    else:
+        source_wiring = _r('''      val source = new SparkJdbcSourceAdapter(
         spark,
         sys.env.getOrElse("JDBC_URL", "jdbc:postgresql://localhost:5432/app"),
         sys.env.getOrElse("JDBC_TABLE", "ventas"),
@@ -1270,21 +1177,35 @@ def report_batch_main(root: Path, svc: str, pkg: str, report_role: str,
         sys.env.getOrElse("JDBC_PASSWORD", "app")
       )
 ''', pkg)
-            source_import = f"import com.example.{pkg}.infrastructure.driven.jdbcsource.SparkJdbcSourceAdapter"
+        source_import = f"import com.example.{pkg}.infrastructure.driven.jdbcsource.SparkJdbcSourceAdapter"
 
-        body = _r('''package com.example.__PKG__.infrastructure.entrypoints
+    transformer_imports = "\n".join(
+        f"import com.example.{pkg}.application.usecases.transformers.{_transformer_class(t)}"
+        for t in types
+    )
+    if types:
+        registry_lines = "\n".join(
+            f"      val t{i} = new {_transformer_class(t)}()" for i, t in enumerate(types)
+        )
+        registry_map = ", ".join(f"t{i}.reportType -> t{i}" for i in range(len(types)))
+    else:
+        registry_lines = "      // TODO: registrar transformers (--report-types vacío)."
+        registry_map = ""
 
-import com.example.__PKG__.application.usecases.ValidateAndExtractUseCase
+    body = _r('''package com.example.__PKG__.infrastructure.entrypoints
+
+import com.example.__PKG__.application.usecases.{ExtractReportUseCase, ReportTransformer, ReportTransformerFactory}
 import com.example.__PKG__.domain.model.{ColumnSpec, ReportSchema, ReportType}
 import com.example.__PKG__.infrastructure.driven.kafkaproducer.KafkaEventPublisher
 import com.example.__PKG__.infrastructure.driven.s3parquet.SparkS3ParquetAdapter
 __SOURCE_IMPORT__
+__TRANSFORMER_IMPORTS__
 import org.apache.spark.sql.SparkSession
 
 import java.util.UUID
 
-/** MS1 — extracción + validación de esquema. Lee el read model CQRS → valida → parquet `raw/`
- *  → publica `report.extracted` (§3, DR-1). */
+/** ETL unificado: lee la fuente → valida esquema → transforma (Factory DR-10)
+ *  → escribe parquet → publica ReportParquetGenerated (un evento por formato). */
 object BatchMain {
 
   def main(args: Array[String]): Unit = {
@@ -1297,17 +1218,24 @@ object BatchMain {
     try {
       val bucket    = sys.env.getOrElse("REPORT_BUCKET", "reports")
       val bootstrap = sys.env.getOrElse("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+      val outTopic  = sys.env.getOrElse("KAFKA_TOPIC_OUT", "__OUT_TOPIC__")
 
 __SOURCE_WIRING__
       val store  = new SparkS3ParquetAdapter(spark, bucket)
       val events = new KafkaEventPublisher(bootstrap)
-      val useCase = new ValidateAndExtractUseCase(source, store, events, "__OUT_TOPIC__")
 
-      val reportType = ReportType.fromString(argMap.getOrElse("reportType", "ventas-mensual"))
+__REGISTRY_LINES__
+      val registry: Map[ReportType, ReportTransformer] = Map(__REGISTRY_MAP__)
+      val factory = new ReportTransformerFactory(registry)
+      val useCase = new ExtractReportUseCase(source, store, factory, events, outTopic)
+
+      val reportType = ReportType.fromString(argMap.getOrElse("reportType", "default"))
       val reportId   = argMap.getOrElse("reportId", UUID.randomUUID().toString)
       val runId      = UUID.randomUUID().toString
+      val formats    = argMap.getOrElse("formats", "csv,xls").split(",").map(_.trim).toList
 
-      // TODO: resolver el ReportSchema vigente desde report_schema_catalog (§9.2).
+      // TODO: resolver el ReportSchema vigente desde report_schema_catalog
+      //       vía REPORTING_JDBC_URL (tabla <prefix>_reporting.report_schema_catalog).
       val schema = ReportSchema(
         reportType,
         version = "v1",
@@ -1319,7 +1247,7 @@ __SOURCE_WIRING__
       )
 
       try {
-        useCase.execute(schema, reportId, runId)
+        useCase.execute(schema, reportType, reportId, runId, formats)
       } finally {
         events.close()
       }
@@ -1329,88 +1257,34 @@ __SOURCE_WIRING__
   }
 
 __SPARK_BUILDER__}
-''', pkg, SOURCE_IMPORT=source_import, SOURCE_WIRING=source_wiring,
-              OUT_TOPIC=out_topic, SPARK_BUILDER=spark_builder)
-
-    else:  # processing
-        imports = "\n".join(
-            f"import com.example.{pkg}.application.usecases.transformers.{_transformer_class(t)}"
-            for t in types
-        )
-        if types:
-            registry_lines = "\n".join(
-                f"      val t{i} = new {_transformer_class(t)}()" for i, t in enumerate(types)
-            )
-            registry_map = ", ".join(f"t{i}.reportType -> t{i}" for i in range(len(types)))
-        else:
-            registry_lines = "      // TODO: registrar transformers (--report-types vacío)."
-            registry_map = ""
-
-        body = _r('''package com.example.__PKG__.infrastructure.entrypoints
-
-import com.example.__PKG__.application.usecases.{ProcessReportUseCase, ReportTransformer, ReportTransformerFactory}
-import com.example.__PKG__.domain.model.ReportType
-import com.example.__PKG__.infrastructure.driven.kafkaproducer.KafkaEventPublisher
-import com.example.__PKG__.infrastructure.driven.s3parquet.SparkS3ParquetAdapter
-import com.example.__PKG__.infrastructure.entrypoints.kafkaconsumer.ReportExtractedConsumer
-__IMPORTS__
-import org.apache.spark.sql.SparkSession
-
-/** MS2 — transformación por tipo de reporte (modo triggered-by-event).
- *  Cablea la ReportTransformerFactory con los tipos registrados (DR-10) y arranca el consumer. */
-object BatchMain {
-
-  def main(args: Array[String]): Unit = {
-    val spark = buildSpark()
-    val bucket    = sys.env.getOrElse("REPORT_BUCKET", "reports")
-    val bootstrap = sys.env.getOrElse("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    val topicIn   = sys.env.getOrElse("KAFKA_TOPIC_IN", "__TOPIC_IN__")
-
-    val store  = new SparkS3ParquetAdapter(spark, bucket)
-    val events = new KafkaEventPublisher(bootstrap)
-
-__REGISTRY_LINES__
-    val registry: Map[ReportType, ReportTransformer] = Map(__REGISTRY_MAP__)
-    val factory = new ReportTransformerFactory(registry)
-    val useCase = new ProcessReportUseCase(factory, store, events, "__OUT_TOPIC__")
-
-    val consumer = new ReportExtractedConsumer(bootstrap, topicIn, "report-processing-service", useCase)
-    sys.addShutdownHook {
-      consumer.stop()
-      events.close()
-      spark.stop()
-    }
-    consumer.start()
-  }
-
-__SPARK_BUILDER__}
-''', pkg, IMPORTS=imports, REGISTRY_LINES=registry_lines, REGISTRY_MAP=registry_map,
-              TOPIC_IN=in_topic, OUT_TOPIC=out_topic, SPARK_BUILDER=spark_builder)
+''', pkg,
+        SOURCE_IMPORT=source_import,
+        TRANSFORMER_IMPORTS=transformer_imports,
+        SOURCE_WIRING=source_wiring,
+        REGISTRY_LINES=registry_lines,
+        REGISTRY_MAP=registry_map,
+        OUT_TOPIC=out_topic,
+        SPARK_BUILDER=spark_builder)
 
     write(root, f"{base}/BatchMain.scala", body)
 
 
 # --------------------------------------------------------------------------- #
-# Orquestación del modo reportería
+# Orquestación del modo reportería (ETL unificado)
 # --------------------------------------------------------------------------- #
-def scaffold_reporting(root: Path, svc: str, pkg: str, report_role: str,
-                       source: str, in_topic: str, out_topic: str,
+def scaffold_reporting(root: Path, svc: str, pkg: str,
+                       source: str, out_topic: str,
                        types: list[str]) -> None:
     report_domain_model(root, pkg)
     s3_parquet_adapter(root, pkg)
     kafka_producer_adapter(root, pkg)
-
-    if report_role == "extraction":
-        validate_extract_use_case(root, pkg, out_topic)
-        if source == "mongo":
-            mongo_source_adapter(root, pkg)
-        else:
-            jdbc_source_adapter(root, pkg)
-    else:  # processing
-        report_transformer_factory(root, pkg, types, out_topic)
-        kafka_consumer_entry_point(root, pkg, in_topic)
-
-    report_batch_main(root, svc, pkg, report_role, source, out_topic, in_topic, types)
+    extract_report_use_case(root, pkg, out_topic)
+    report_transformer_factory(root, pkg, types, out_topic)
+    if source == "mongo":
+        mongo_source_adapter(root, pkg)
+    else:
+        jdbc_source_adapter(root, pkg)
+    report_batch_main(root, svc, pkg, source, out_topic, types)
 
 
 # --------------------------------------------------------------------------- #
@@ -1424,15 +1298,80 @@ def write(root: Path, relative: str, content: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Migraciones Liquibase de MS1 (report-extraction-service)
+# --------------------------------------------------------------------------- #
+def write_extraction_liquibase_structure(root: Path, service_name: str,
+                                         pg_db_prefix: str,
+                                         migrations_dir: str = "") -> None:
+    """Genera db/<service_name>/changelog/ con el schema de report_schema_catalog.
+
+    MS1 (report-etl-service / report-extraction-service) es propietario de la BD
+    <prefix>_reporting y necesita la tabla report_schema_catalog para validar el
+    DataFrame extraído contra el esquema declarado (DR-1 / ValidateAndExtractUseCase).
+    Solo aplica cuando --report-role extraction; los demás modos no poseen BDs PostgreSQL.
+    Flyway requiere JDBC bloqueante — incompatible con los servicios R2DBC del framework;
+    Liquibase corre standalone via run-liquibase-migrations.sh antes del despliegue.
+    """
+    if migrations_dir:
+        db_svc_dir = Path(migrations_dir) / service_name
+    else:
+        db_svc_dir = root.parent.parent / "db" / service_name
+    changelog_dir = db_svc_dir / "changelog"
+    changelog_dir.mkdir(parents=True, exist_ok=True)
+
+    reporting_db = f"{pg_db_prefix}_reporting" if pg_db_prefix else "reporting"
+
+    (db_svc_dir / "liquibase.properties").write_text(
+        f"url=jdbc:postgresql://${{VPS_IP:-localhost}}:5432/{reporting_db}\n"
+        f"username=${{REPORTING_JDBC_USER}}\n"
+        f"password=${{REPORTING_JDBC_PASSWORD}}\n"
+        "changeLogFile=changelog/root.yaml\n"
+        "liquibaseSchemaName=public\n"
+    )
+
+    (changelog_dir / "root.yaml").write_text(
+        "databaseChangeLog:\n"
+        "  - include:\n"
+        "      file: changelog/00001_initial_schema.yaml\n"
+        "      relativeToChangelogFile: true\n"
+    )
+
+    (changelog_dir / "00001_initial_schema.yaml").write_text(
+        "databaseChangeLog:\n"
+        "  - changeSet:\n"
+        "      id: 00001-report-schema-catalog\n"
+        "      author: scaffold\n"
+        f"      comment: \"Catálogo de esquemas de reportería para {service_name} (DR-1)\"\n"
+        "      changes:\n"
+        "        - sql:\n"
+        "            sql: |\n"
+        "              CREATE TABLE IF NOT EXISTS report_schema_catalog (\n"
+        "                  report_type      VARCHAR(120) PRIMARY KEY,\n"
+        "                  schema_version   VARCHAR(20)  NOT NULL,\n"
+        "                  columns          JSONB        NOT NULL DEFAULT '[]',\n"
+        "                  integrity_rules  JSONB        NOT NULL DEFAULT '[]',\n"
+        "                  updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()\n"
+        "              );\n"
+        "              COMMENT ON TABLE report_schema_catalog IS\n"
+        "                  'Esquemas declarativos por tipo de reporte. "
+        "MS1 los lee para validar el DataFrame extraido (DR-1).';\n"
+        "            stripComments: false\n"
+    )
+
+    logger.info("Liquibase structure (report_schema_catalog) generada en: %s", db_svc_dir)
+
+
+# --------------------------------------------------------------------------- #
 # scaffold
 # --------------------------------------------------------------------------- #
 def scaffold(service_name: str, root_arg: str | None, service_name_provided: bool,
              report_role: str | None = None, source: str = "mongo",
-             kafka_in: str = "report.extracted", kafka_out: str | None = None,
+             kafka_out: str | None = None,
              report_types: str = "",
              schedule: str = "0 * * * *",
              org: str = "myproject",
-             pg_db_prefix: str = "") -> None:
+             pg_db_prefix: str = "",
+             migrations_dir: str = "") -> None:
     root = Path(root_arg) if root_arg else Path(".")
     if service_name_provided:
         root = root / service_name
@@ -1442,9 +1381,8 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
 
     pkg = service_name.replace("-", "")
 
-    # default de kafka_out por rol
     if kafka_out is None:
-        kafka_out = "report.processed" if report_role == "processing" else "report.extracted"
+        kafka_out = "report.parquet.generated"
 
     types = [t.strip() for t in report_types.split(",") if t.strip()]
 
@@ -1459,9 +1397,8 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
         driven_adapters(root, pkg)
         entry_points(root, service_name, pkg)
     else:
-        logger.info("Report role: %s | source: %s | types: %s", report_role, source, types)
-        scaffold_reporting(root, service_name, pkg, report_role, source,
-                           kafka_in, kafka_out, types)
+        logger.info("ETL unificado: source=%s | types=%s | out_topic=%s", source, types, kafka_out)
+        scaffold_reporting(root, service_name, pkg, source, kafka_out, types)
 
     # Helm chart (CronJob)
     helm_root = root / "helm" / service_name
@@ -1479,6 +1416,10 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
                                                           pg_db_prefix=pg_db_prefix))
     secrets_script.chmod(0o755)
     logger.info("scripts/create-secrets-dev.sh creado")
+
+    # Migraciones Liquibase — solo MS1 (extraction) posee una BD PostgreSQL propia.
+    if report_role == "extraction":
+        write_extraction_liquibase_structure(root, service_name, pg_db_prefix, migrations_dir)
 
     # Jenkinsfile
     write(root, "Jenkinsfile", get_jenkinsfile_content(service_name, org))
@@ -1509,18 +1450,10 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
       sbt "entryPoints/run"
 """)
     else:
-        if report_role == "extraction" and source == "mongo":
-            print("    (requiere K3s corriendo con MongoDB y Kafka via Strimzi)")
-        elif report_role == "extraction":
-            print("    (requiere K3s corriendo con PostgreSQL read model y Kafka via Strimzi)")
-        else:
-            print("    (requiere K3s corriendo con Kafka via Strimzi)")
-        if report_role == "extraction":
-            print(f'\n 3. Ejecutar extracción:\n      sbt "entryPoints/run --reportType ventas-mensual"')
-            print(f"    → valida esquema, escribe raw/ y publica '{kafka_out}'")
-        else:
-            print(f'\n 3. Ejecutar procesamiento:\n      sbt "entryPoints/run"')
-            print(f"    → consume '{kafka_in}', transforma y publica '{kafka_out}'")
+        src_req = "MongoDB y " if source == "mongo" else "PostgreSQL read model (<prefix>_readmodel) y "
+        print(f"    (requiere K3s corriendo con {src_req}Kafka via Strimzi)")
+        print(f'\n 3. Ejecutar ETL unificado:\n      sbt "entryPoints/run --reportType ventas-mensual --formats csv,xls"')
+        print(f"    → valida esquema, transforma via Factory, escribe parquet y publica '{kafka_out}'")
 
     print(f"""
  4. Override Spark master (cluster externo):
@@ -1558,7 +1491,7 @@ def scaffold(service_name: str, root_arg: str | None, service_name_provided: boo
 
     Jenkinsfile generado con pipeline:
       Checkout → Build & Test → SonarQube → Security Scans
-      → Kaniko build/push ECR → Trivy scan → bumpImageTag (GitOps)
+      → Kaniko build/push Gitea Registry → Trivy scan → bumpImageTag (GitOps)
     ArgoCD detecta el commit y actualiza el CronJob en el cluster.
 
 ════════════════════════════════════════════════════════════════════════
@@ -1572,16 +1505,19 @@ def main() -> None:
     )
     parser.add_argument("--service-name", default="users", metavar="NAME",
                         help="Nombre del servicio (default: users)")
-    parser.add_argument("--report-role", choices=["extraction", "processing"], default=None,
-                        help="Activa el modo reportería (ETL Spark). Sin este flag → arquetipo genérico.")
+    parser.add_argument("--report-role", choices=["extraction"], default=None,
+                        help="Activa el modo ETL unificado (report-etl-service). "
+                             "Sin este flag → arquetipo batch genérico.")
     parser.add_argument("--source", choices=["mongo", "jdbc"], default="mongo",
-                        help="Solo extraction: fuente de datos (mongo=read model CQRS [default] | jdbc).")
-    parser.add_argument("--kafka-in", default="report.extracted", metavar="TOPIC",
-                        help="Solo processing: topic Kafka a consumir (default: report.extracted).")
+                        help="Fuente de datos del ETL: mongo=read model CQRS MongoDB [default] | "
+                             "jdbc=read model CQRS PostgreSQL (<prefix>_readmodel).")
     parser.add_argument("--kafka-out", default=None, metavar="TOPIC",
-                        help="Topic Kafka a publicar (default: report.extracted en extraction / report.processed en processing).")
+                        help="Topic Kafka donde publicar ReportParquetGenerated "
+                             "(default: report.parquet.generated).")
     parser.add_argument("--report-types", default="", metavar="CSV",
-                        help="Solo processing: lista CSV de tipos de reporte (un transformer + registro por tipo).")
+                        help="Lista CSV de tipos de reporte del ETL unificado "
+                             "(un ReportTransformer + registro en la Factory por tipo, DR-10). "
+                             "Ej: ventas-mensual,cartera-mora")
     parser.add_argument("--schedule", default="0 * * * *", metavar="CRON",
                         help="Expresión cron del CronJob K8s (default: '0 * * * *' = cada hora). "
                              "Ej: '0 2 * * *' = 2 AM diario, '0 8 * * 1' = lunes 8 AM.")
@@ -1592,7 +1528,12 @@ def main() -> None:
     parser.add_argument("--pg-db", default="", metavar="PREFIX",
                         help="Prefijo de BD PostgreSQL (Database-per-Service). "
                              "El read model CQRS (--source jdbc) usará: <prefix>_readmodel. "
+                             "La BD de reportería propia de MS1 usará: <prefix>_reporting. "
                              "Debe coincidir con el -p/--pg-db de init-databases.sh.")
+    parser.add_argument("--migrations-dir", default="", metavar="DIR",
+                        help="Directorio raíz de changelogs Liquibase "
+                             "(default: <repo_root>/db/). Solo aplica con --report-role extraction. "
+                             "Debe coincidir con el --db-dir de run-liquibase-migrations.sh.")
     parser.add_argument("root", nargs="?", default=None, metavar="ROOT",
                         help="Directorio raíz donde generar el proyecto (default: .)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1613,11 +1554,12 @@ def main() -> None:
     try:
         scaffold(args.service_name, args.root, service_name_provided,
                  report_role=args.report_role, source=args.source,
-                 kafka_in=args.kafka_in, kafka_out=args.kafka_out,
+                 kafka_out=args.kafka_out,
                  report_types=args.report_types,
                  schedule=args.schedule,
                  org=args.org,
-                 pg_db_prefix=args.pg_db)
+                 pg_db_prefix=args.pg_db,
+                 migrations_dir=args.migrations_dir)
     except OSError as e:
         logger.error("No se pudo crear el proyecto: %s", e)
         sys.exit(1)

@@ -693,14 +693,102 @@ public class UseCasesConfig {{
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Migraciones Liquibase del integration-service
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_integration_liquibase_structure(root: Path, project_name: str,
+                                          pg_db_prefix: str,
+                                          migrations_dir: str = "") -> None:
+    """Genera db/<project_name>/changelog/ con el schema de saga (Liquibase standalone).
+
+    A diferencia de los microservicios de dominio, las tablas saga_instance y
+    saga_step_log son infraestructura de orquestación — siempre iguales — por lo que
+    se genera el DDL exacto en lugar de un placeholder relleno por --bc-tags.
+    Flyway requiere JDBC bloqueante (incompatible con R2DBC); Liquibase corre como
+    proceso independiente antes del despliegue via run-liquibase-migrations.sh.
+    """
+    if migrations_dir:
+        db_svc_dir = Path(migrations_dir) / project_name
+    else:
+        db_svc_dir = root.parent.parent / "db" / project_name
+    changelog_dir = db_svc_dir / "changelog"
+    changelog_dir.mkdir(parents=True, exist_ok=True)
+
+    svc_slug = project_name.replace("-", "_")
+    db_name = f"{pg_db_prefix}_{svc_slug}" if pg_db_prefix else svc_slug
+
+    (db_svc_dir / "liquibase.properties").write_text(
+        f"url=jdbc:postgresql://${{VPS_IP:-localhost}}:5432/{db_name}\n"
+        f"username=${{DB_USERNAME}}\n"
+        f"password=${{DB_PASSWORD}}\n"
+        "changeLogFile=changelog/root.yaml\n"
+        "liquibaseSchemaName=public\n"
+    )
+
+    (changelog_dir / "root.yaml").write_text(
+        "databaseChangeLog:\n"
+        "  - include:\n"
+        "      file: changelog/00001_initial_schema.yaml\n"
+        "      relativeToChangelogFile: true\n"
+    )
+
+    (changelog_dir / "00001_initial_schema.yaml").write_text(
+        "databaseChangeLog:\n"
+        "  - changeSet:\n"
+        "      id: 00001-saga-instance\n"
+        "      author: scaffold\n"
+        f"      comment: \"Tabla de estado de saga para {project_name} (orquestador)\"\n"
+        "      changes:\n"
+        "        - sql:\n"
+        "            sql: |\n"
+        "              CREATE TABLE IF NOT EXISTS saga_instance (\n"
+        "                  saga_id      VARCHAR(120)  PRIMARY KEY,\n"
+        "                  saga_type    VARCHAR(120)  NOT NULL,\n"
+        "                  state        VARCHAR(50)   NOT NULL DEFAULT 'STARTED',\n"
+        "                  current_step INTEGER       NOT NULL DEFAULT 0,\n"
+        "                  payload      JSONB         NOT NULL DEFAULT '{}',\n"
+        "                  created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),\n"
+        "                  updated_at   TIMESTAMPTZ   NOT NULL DEFAULT now()\n"
+        "              );\n"
+        "              CREATE INDEX IF NOT EXISTS idx_saga_instance_type_state\n"
+        "                  ON saga_instance (saga_type, state);\n"
+        "            stripComments: true\n"
+        "  - changeSet:\n"
+        "      id: 00001-saga-step-log\n"
+        "      author: scaffold\n"
+        f"      comment: \"Log de pasos ejecutados por {project_name} para compensación\"\n"
+        "      changes:\n"
+        "        - sql:\n"
+        "            sql: |\n"
+        "              CREATE TABLE IF NOT EXISTS saga_step_log (\n"
+        "                  id                   BIGSERIAL    PRIMARY KEY,\n"
+        "                  saga_id              VARCHAR(120) NOT NULL\n"
+        "                      REFERENCES saga_instance(saga_id),\n"
+        "                  step_name            VARCHAR(120) NOT NULL,\n"
+        "                  status               VARCHAR(50)  NOT NULL,\n"
+        "                  compensation_payload JSONB,\n"
+        "                  executed_at          TIMESTAMPTZ  NOT NULL DEFAULT now()\n"
+        "              );\n"
+        "              CREATE INDEX IF NOT EXISTS idx_saga_step_log_saga_id\n"
+        "                  ON saga_step_log (saga_id);\n"
+        "            stripComments: true\n"
+    )
+
+    logger.info("Liquibase structure (saga) generada en: %s", db_svc_dir)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Orquestación del scaffold
 # ─────────────────────────────────────────────────────────────────────────────
 
 def scaffold_integration(project_name: str, externals: list[str], flows: list[str],
-                         port: int, org: str) -> None:
+                         port: int, org: str,
+                         pg_db_prefix: str = "",
+                         migrations_dir: str = "") -> None:
     safe = project_name.replace("-", "")
     root = Path(project_name)
-    logger.info("Creando %s (externos=%s, sagas=%s, port=%d)", project_name, externals, flows, port)
+    logger.info("Creando %s (externos=%s, sagas=%s, port=%d, pg_prefix=%s)",
+                project_name, externals, flows, port, pg_db_prefix or org)
 
     modules = [
         "domain/model",
@@ -781,6 +869,10 @@ public class IntegrationHealthController {{
     secret_script.write_text(get_integration_secrets_script(project_name, port, org, externals))
     secret_script.chmod(0o755)
 
+    # Migraciones Liquibase — tablas saga_instance y saga_step_log (DDL exacto, no placeholder)
+    effective_prefix = pg_db_prefix if pg_db_prefix else org
+    write_integration_liquibase_structure(root, project_name, effective_prefix, migrations_dir)
+
     helm_root = root / "helm" / project_name
     for rel_path, content in base.get_helm_chart_files(project_name, port).items():
         target = helm_root / rel_path
@@ -797,6 +889,9 @@ public class IntegrationHealthController {{
     print(f"  Sistemas externos (rutas Camel): {', '.join(externals) or '(ninguno)'}")
     print(f"  Flujos de saga (orquestador):    {', '.join(flows) or '(ninguno)'}")
     print(f"  Coordinador de saga: Narayana LRA (camel-lra {CAMEL_VERSION})")
+    svc_slug = project_name.replace("-", "_")
+    print(f"  BD saga: {effective_prefix}_{svc_slug}")
+    print(f"  Liquibase: db/{project_name}/changelog/00001_initial_schema.yaml")
     print("  Compila con: mvn -q -DskipTests package")
 
 
@@ -827,6 +922,14 @@ def main() -> None:
                         help="Sistemas externos: 'nombre=BC-XX,nombre2=BC-YY' (rutas Camel).")
     parser.add_argument("--saga-flows", default="",
                         help="Flujos de saga a orquestar: 'flujo1,flujo2' (un orquestador por flujo).")
+    parser.add_argument("--pg-db-prefix", default="",
+                        help="Prefijo de la BD PostgreSQL (ej. myapp). "
+                             "Deriva la BD como <prefix>_<svc_slug>. "
+                             "Si se omite usa --org como prefijo.")
+    parser.add_argument("--migrations-dir", default="",
+                        help="Directorio raíz de changelogs Liquibase "
+                             "(default: <repo_root>/db/). "
+                             "Debe coincidir con el --db-dir de run-liquibase-migrations.sh.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Logs de depuración.")
     args = parser.parse_args()
 
@@ -835,7 +938,9 @@ def main() -> None:
 
     externals = _parse_externals(args.external_systems)
     flows = _parse_csv(args.saga_flows)
-    scaffold_integration(args.service_name, externals, flows, args.port, args.org)
+    scaffold_integration(args.service_name, externals, flows, args.port, args.org,
+                         pg_db_prefix=args.pg_db_prefix,
+                         migrations_dir=args.migrations_dir)
 
 
 if __name__ == "__main__":
